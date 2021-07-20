@@ -9,11 +9,14 @@ use core::{
 use std::io::Read;
 
 use blst::*;
-use fff::{Field, PrimeField, PrimeFieldRepr};
-use groupy::{CurveAffine, CurveProjective, EncodedPoint};
+use group::{
+    prime::{PrimeCurve, PrimeCurveAffine, PrimeGroup},
+    Curve, Group, GroupEncoding, UncompressedEncoding, WnafGroup,
+};
 use rand_core::RngCore;
+use subtle::{Choice, ConditionallySelectable, CtOption};
 
-use crate::{Fp, Fp12, G2Affine, Scalar, ScalarRepr};
+use crate::{Bls12, Engine, Fp, Fp12, G2Affine, Gt, PairingCurveAffine, Scalar};
 
 /// This is an element of $\mathbb{G}_1$ represented in the affine coordinate space.
 /// It is ideal to keep elements in this representation to reduce memory usage and
@@ -43,7 +46,7 @@ impl fmt::Display for G1Affine {
 
 impl Default for G1Affine {
     fn default() -> G1Affine {
-        G1Affine::zero()
+        G1Affine::identity()
     }
 }
 
@@ -83,15 +86,37 @@ impl PartialEq for G1Affine {
     }
 }
 
+impl Neg for &G1Projective {
+    type Output = G1Projective;
+
+    #[inline]
+    fn neg(self) -> G1Projective {
+        let mut neg = *self;
+        unsafe { blst_p1_cneg(&mut neg.0, true) };
+        neg
+    }
+}
+
+impl Neg for G1Projective {
+    type Output = G1Projective;
+
+    #[inline]
+    fn neg(self) -> G1Projective {
+        -&self
+    }
+}
+
 impl Neg for &G1Affine {
     type Output = G1Affine;
 
     #[inline]
     fn neg(self) -> G1Affine {
-        let mut res = *self;
-        res.negate();
-
-        res
+        // Missing for affine in blst
+        let mut neg = *self;
+        if !self.is_zero() {
+            neg.0.y = (-self.y()).0;
+        }
+        neg
     }
 }
 
@@ -104,41 +129,132 @@ impl Neg for G1Affine {
     }
 }
 
-impl<'a, 'b> Add<&'b G1Projective> for &'a G1Affine {
+impl Add<&G1Projective> for &G1Projective {
     type Output = G1Projective;
 
     #[inline]
-    fn add(self, rhs: &'b G1Projective) -> G1Projective {
+    fn add(self, rhs: &G1Projective) -> G1Projective {
+        let mut out = blst_p1::default();
+        unsafe { blst_p1_add_or_double(&mut out, &self.0, &rhs.0) };
+        G1Projective(out)
+    }
+}
+
+impl Add<&G1Projective> for &G1Affine {
+    type Output = G1Projective;
+
+    #[inline]
+    fn add(self, rhs: &G1Projective) -> G1Projective {
         rhs.add_mixed(self)
     }
 }
 
-impl<'a, 'b> Add<&'b G1Affine> for &'a G1Projective {
+impl Add<&G1Affine> for &G1Projective {
     type Output = G1Projective;
 
     #[inline]
-    fn add(self, rhs: &'b G1Affine) -> G1Projective {
+    fn add(self, rhs: &G1Affine) -> G1Projective {
         self.add_mixed(rhs)
     }
 }
 
-impl<'a, 'b> Sub<&'b G1Projective> for &'a G1Affine {
+impl Sub<&G1Projective> for &G1Projective {
     type Output = G1Projective;
 
     #[inline]
-    fn sub(self, rhs: &'b G1Projective) -> G1Projective {
+    fn sub(self, rhs: &G1Projective) -> G1Projective {
         self + (-rhs)
     }
 }
 
-impl<'a, 'b> Sub<&'b G1Affine> for &'a G1Projective {
+impl Sub<&G1Projective> for &G1Affine {
     type Output = G1Projective;
 
     #[inline]
-    fn sub(self, rhs: &'b G1Affine) -> G1Projective {
+    fn sub(self, rhs: &G1Projective) -> G1Projective {
         self + (-rhs)
     }
 }
+
+impl Sub<&G1Affine> for &G1Projective {
+    type Output = G1Projective;
+
+    #[inline]
+    fn sub(self, rhs: &G1Affine) -> G1Projective {
+        self + (-rhs)
+    }
+}
+
+impl AddAssign<&G1Projective> for G1Projective {
+    #[inline]
+    fn add_assign(&mut self, rhs: &G1Projective) {
+        unsafe { blst_p1_add_or_double(&mut self.0, &self.0, &rhs.0) };
+    }
+}
+
+impl SubAssign<&G1Projective> for G1Projective {
+    #[inline]
+    fn sub_assign(&mut self, rhs: &G1Projective) {
+        *self += &-rhs;
+    }
+}
+
+impl AddAssign<&G1Affine> for G1Projective {
+    #[inline]
+    fn add_assign(&mut self, rhs: &G1Affine) {
+        *self = *self + rhs;
+    }
+}
+
+impl SubAssign<&G1Affine> for G1Projective {
+    #[inline]
+    fn sub_assign(&mut self, rhs: &G1Affine) {
+        *self += &-rhs;
+    }
+}
+
+impl Mul<&Scalar> for &G1Projective {
+    type Output = G1Projective;
+
+    fn mul(self, scalar: &Scalar) -> Self::Output {
+        self.multiply(&scalar)
+    }
+}
+
+impl Mul<&Scalar> for &G1Affine {
+    type Output = G1Projective;
+
+    fn mul(self, scalar: &Scalar) -> Self::Output {
+        G1Projective::from(self).multiply(&scalar)
+    }
+}
+
+impl MulAssign<&Scalar> for G1Projective {
+    #[inline]
+    fn mul_assign(&mut self, rhs: &Scalar) {
+        *self = *self * rhs;
+    }
+}
+
+impl MulAssign<&Scalar> for G1Affine {
+    #[inline]
+    fn mul_assign(&mut self, rhs: &Scalar) {
+        *self = (*self * rhs).into();
+    }
+}
+
+impl_add_sub!(G1Projective);
+impl_add_sub!(G1Projective, G1Affine);
+impl_add_sub!(G1Affine, G1Projective, G1Projective);
+
+impl_add_sub_assign!(G1Projective);
+impl_add_sub_assign!(G1Projective, G1Affine);
+
+impl_mul!(G1Projective, Scalar);
+impl_mul!(G1Affine, Scalar, G1Projective);
+
+impl_mul_assign!(G1Projective, Scalar);
+impl_mul_assign!(G1Affine, Scalar);
 
 impl<T> Sum<T> for G1Projective
 where
@@ -148,52 +264,42 @@ where
     where
         I: Iterator<Item = T>,
     {
-        iter.fold(Self::zero(), |acc, item| acc + item.borrow())
+        iter.fold(Self::identity(), |acc, item| acc + item.borrow())
     }
 }
 
-impl_binops_additive_mixed!(G1Projective, G1Affine, groupy::CurveProjective);
-impl_binops_additive_specify_output!(G1Affine, G1Projective, G1Projective);
-
-impl groupy::CurveAffine for G1Affine {
-    type Engine = crate::Bls12;
-    type Scalar = Scalar;
-    type Base = Fp;
-    type Projective = G1Projective;
-    type Uncompressed = G1Uncompressed;
-    type Compressed = G1Compressed;
-
-    fn zero() -> Self {
-        G1Affine(blst_p1_affine::default())
+impl ConditionallySelectable for G1Affine {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        G1Affine(blst_p1_affine {
+            x: Fp::conditional_select(&a.x(), &b.x(), choice).0,
+            y: Fp::conditional_select(&a.y(), &b.y(), choice).0,
+        })
     }
+}
 
-    fn one() -> Self {
-        G1Affine(unsafe { *blst_p1_affine_generator() })
-    }
-
-    fn is_zero(&self) -> bool {
-        unsafe { blst_p1_affine_is_inf(&self.0) }
-    }
-
-    fn mul<S: Into<<Self::Scalar as PrimeField>::Repr>>(&self, by: S) -> Self::Projective {
-        G1Projective::from(self).multiply(&by.into())
-    }
-
-    fn negate(&mut self) {
-        // Missing for affine in blst
-        if !self.is_zero() {
-            let mut y = self.y();
-            y.negate();
-            self.0.y = y.0;
-        }
-    }
-
-    fn into_projective(&self) -> Self::Projective {
-        (*self).into()
+impl ConditionallySelectable for G1Projective {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        G1Projective(blst_p1 {
+            x: Fp::conditional_select(&a.x(), &b.x(), choice).0,
+            y: Fp::conditional_select(&a.y(), &b.y(), choice).0,
+            z: Fp::conditional_select(&a.z(), &b.z(), choice).0,
+        })
     }
 }
 
 impl G1Affine {
+    pub fn zero() -> Self {
+        G1Affine(blst_p1_affine::default())
+    }
+
+    pub fn one() -> Self {
+        G1Affine(unsafe { *blst_p1_affine_generator() })
+    }
+
+    pub fn is_zero(&self) -> bool {
+        unsafe { blst_p1_affine_is_inf(&self.0) }
+    }
+
     /// Serializes this element into compressed form.
     pub fn to_compressed(&self) -> [u8; 48] {
         let mut out = [0u8; 48];
@@ -217,14 +323,9 @@ impl G1Affine {
     }
 
     /// Attempts to deserialize an uncompressed element.
-    pub fn from_uncompressed(bytes: &[u8; 96]) -> Option<Self> {
-        G1Affine::from_uncompressed_unchecked(bytes).and_then(|el| {
-            if el.is_zero() || el.is_torsion_free() {
-                Some(el)
-            } else {
-                None
-            }
-        })
+    pub fn from_uncompressed(bytes: &[u8; 96]) -> CtOption<Self> {
+        G1Affine::from_uncompressed_unchecked(bytes)
+            .and_then(|p| CtOption::new(p, p.is_identity() | p.is_torsion_free()))
     }
 
     /// Attempts to deserialize an uncompressed element, not checking if the
@@ -232,27 +333,17 @@ impl G1Affine {
     ///
     /// **This is dangerous to call unless you trust the bytes you are reading; otherwise,
     /// API invariants may be broken.** Please consider using `from_uncompressed()` instead.
-    pub fn from_uncompressed_unchecked(bytes: &[u8; 96]) -> Option<Self> {
-        if bytes.iter().all(|&b| b == 0) {
-            return Some(Self::zero());
-        }
+    pub fn from_uncompressed_unchecked(bytes: &[u8; 96]) -> CtOption<Self> {
         let mut raw = blst_p1_affine::default();
-        if unsafe { blst_p1_deserialize(&mut raw, bytes.as_ptr()) != BLST_ERROR::BLST_SUCCESS } {
-            return None;
-        }
-
-        Some(G1Affine(raw))
+        let success =
+            unsafe { blst_p1_deserialize(&mut raw, bytes.as_ptr()) != BLST_ERROR::BLST_SUCCESS };
+        CtOption::new(G1Affine(raw), Choice::from(success as u8))
     }
 
     /// Attempts to deserialize a compressed element.
-    pub fn from_compressed(bytes: &[u8; 48]) -> Option<Self> {
-        G1Affine::from_compressed_unchecked(bytes).and_then(|el| {
-            if el.is_zero() || el.is_torsion_free() {
-                Some(el)
-            } else {
-                None
-            }
-        })
+    pub fn from_compressed(bytes: &[u8; 48]) -> CtOption<Self> {
+        G1Affine::from_compressed_unchecked(bytes)
+            .and_then(|p| CtOption::new(p, p.is_identity() | p.is_torsion_free()))
     }
 
     /// Attempts to deserialize an uncompressed element, not checking if the
@@ -260,31 +351,24 @@ impl G1Affine {
     ///
     /// **This is dangerous to call unless you trust the bytes you are reading; otherwise,
     /// API invariants may be broken.** Please consider using `from_compressed()` instead.
-    pub fn from_compressed_unchecked(bytes: &[u8; 48]) -> Option<Self> {
-        if bytes.iter().all(|&b| b == 0) {
-            return Some(Self::zero());
-        }
-
+    pub fn from_compressed_unchecked(bytes: &[u8; 48]) -> CtOption<Self> {
         let mut raw = blst_p1_affine::default();
-
-        if unsafe { blst_p1_uncompress(&mut raw, bytes.as_ptr()) != BLST_ERROR::BLST_SUCCESS } {
-            return None;
-        }
-
-        Some(G1Affine(raw))
+        let success =
+            unsafe { blst_p1_uncompress(&mut raw, bytes.as_ptr()) == BLST_ERROR::BLST_SUCCESS };
+        CtOption::new(G1Affine(raw), Choice::from(success as u8))
     }
 
     /// Returns true if this point is free of an $h$-torsion component, and so it
     /// exists within the $q$-order subgroup $\mathbb{G}_1$. This should always return true
     /// unless an "unchecked" API was used.
-    pub fn is_torsion_free(&self) -> bool {
-        unsafe { blst_p1_affine_in_g1(&self.0) }
+    pub fn is_torsion_free(&self) -> Choice {
+        unsafe { Choice::from(blst_p1_affine_in_g1(&self.0) as u8) }
     }
 
     /// Returns true if this point is on the curve. This should always return
     /// true unless an "unchecked" API was used.
     pub fn is_on_curve(&self) -> bool {
-        unsafe { blst_p1_affine_on_curve(&self.0) }
+        unsafe { blst_p1_affine_on_curve(&self.0) || self.is_zero() }
     }
 
     pub fn from_raw_unchecked(x: Fp, y: Fp, _infinity: bool) -> Self {
@@ -312,14 +396,9 @@ impl G1Affine {
         48
     }
 
-    fn perform_pairing(&self, other: &G2Affine) -> Fp12 {
-        use crate::Engine;
-        crate::Bls12::pairing(*self, *other)
-    }
-
     #[inline]
     pub fn raw_fmt_size() -> usize {
-        let s = G1Uncompressed::size();
+        let s = G1Affine::uncompressed_size();
         s + 1
     }
 
@@ -342,12 +421,15 @@ impl G1Affine {
 
         let mut buf = [0u8; 96];
         reader.read_exact(&mut buf)?;
-        Self::from_uncompressed_unchecked(&buf).ok_or_else(|| {
-            std::io::Error::new(
+        let res = Self::from_uncompressed_unchecked(&buf);
+        if res.is_some().into() {
+            Ok(res.unwrap())
+        } else {
+            Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                groupy::GroupDecodingError::NotOnCurve,
-            )
-        })
+                "not on curve",
+            ))
+        }
     }
 
     pub fn read_raw_checked<R: Read>(mut reader: R) -> Result<Self, std::io::Error> {
@@ -357,12 +439,15 @@ impl G1Affine {
 
         let mut buf = [0u8; 96];
         reader.read_exact(&mut buf)?;
-        Self::from_uncompressed(&buf).ok_or_else(|| {
-            std::io::Error::new(
+        let res = Self::from_uncompressed(&buf);
+        if res.is_some().into() {
+            Ok(res.unwrap())
+        } else {
+            Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                groupy::GroupDecodingError::NotOnCurve,
-            )
-        })
+                "not on curve",
+            ))
+        }
     }
 }
 
@@ -425,80 +510,19 @@ impl PartialEq for G1Projective {
     }
 }
 
-impl<'a> Neg for &'a G1Projective {
-    type Output = G1Projective;
-
-    #[inline]
-    fn neg(self) -> G1Projective {
-        let mut out = *self;
-        out.negate();
-
-        out
-    }
-}
-
-impl Neg for G1Projective {
-    type Output = G1Projective;
-
-    #[inline]
-    fn neg(self) -> G1Projective {
-        -&self
-    }
-}
-
-impl<'a, 'b> Add<&'b G1Projective> for &'a G1Projective {
-    type Output = G1Projective;
-
-    #[inline]
-    fn add(self, rhs: &'b G1Projective) -> G1Projective {
-        self.add(rhs)
-    }
-}
-
-impl<'a, 'b> Sub<&'b G1Projective> for &'a G1Projective {
-    type Output = G1Projective;
-
-    #[inline]
-    fn sub(self, rhs: &'b G1Projective) -> G1Projective {
-        self + (-rhs)
-    }
-}
-
-impl<'a, 'b> Mul<&'b Scalar> for &'a G1Projective {
-    type Output = G1Projective;
-
-    fn mul(self, other: &'b Scalar) -> Self::Output {
-        self.multiply(&other.into_repr())
-    }
-}
-
-impl<'a, 'b> Mul<&'b Scalar> for &'a G1Affine {
-    type Output = G1Projective;
-
-    fn mul(self, other: &'b Scalar) -> Self::Output {
-        G1Projective::from(self).multiply(&other.into_repr())
-    }
-}
-
-impl_binops_additive!(G1Projective, G1Projective, groupy::CurveProjective);
-impl_binops_multiplicative_mixed!(G1Projective, Scalar, G1Projective);
-impl_binops_multiplicative_mixed!(G1Affine, Scalar, G1Projective);
-
-impl MulAssign<Scalar> for G1Projective {
-    #[inline]
-    fn mul_assign(&mut self, rhs: Scalar) {
-        *self = *self * rhs;
-    }
-}
-
-impl<'b> MulAssign<&'b Scalar> for G1Projective {
-    #[inline]
-    fn mul_assign(&mut self, rhs: &'b Scalar) {
-        *self = *self * rhs;
-    }
-}
-
 impl G1Projective {
+    pub fn zero() -> Self {
+        G1Projective(blst_p1::default())
+    }
+
+    pub fn one() -> Self {
+        G1Projective(unsafe { *blst_p1_generator() })
+    }
+
+    pub fn is_zero(&self) -> bool {
+        unsafe { blst_p1_is_inf(&self.0) }
+    }
+
     /// Serializes this element into compressed form.
     pub fn to_compressed(&self) -> [u8; 48] {
         let mut out = [0u8; 48];
@@ -522,7 +546,7 @@ impl G1Projective {
     }
 
     /// Attempts to deserialize an uncompressed element.
-    pub fn from_uncompressed(bytes: &[u8; 96]) -> Option<Self> {
+    pub fn from_uncompressed(bytes: &[u8; 96]) -> CtOption<Self> {
         G1Affine::from_uncompressed(bytes).map(Into::into)
     }
 
@@ -531,12 +555,12 @@ impl G1Projective {
     ///
     /// **This is dangerous to call unless you trust the bytes you are reading; otherwise,
     /// API invariants may be broken.** Please consider using `from_uncompressed()` instead.
-    pub fn from_uncompressed_unchecked(bytes: &[u8; 96]) -> Option<Self> {
+    pub fn from_uncompressed_unchecked(bytes: &[u8; 96]) -> CtOption<Self> {
         G1Affine::from_uncompressed_unchecked(bytes).map(Into::into)
     }
 
     /// Attempts to deserialize a compressed element.
-    pub fn from_compressed(bytes: &[u8; 48]) -> Option<Self> {
+    pub fn from_compressed(bytes: &[u8; 48]) -> CtOption<Self> {
         G1Affine::from_compressed(bytes).map(Into::into)
     }
 
@@ -545,21 +569,12 @@ impl G1Projective {
     ///
     /// **This is dangerous to call unless you trust the bytes you are reading; otherwise,
     /// API invariants may be broken.** Please consider using `from_compressed()` instead.
-    pub fn from_compressed_unchecked(bytes: &[u8; 48]) -> Option<Self> {
+    pub fn from_compressed_unchecked(bytes: &[u8; 48]) -> CtOption<Self> {
         G1Affine::from_compressed_unchecked(bytes).map(Into::into)
     }
 
-    /// Adds this point to another point.
-    pub fn add(&self, rhs: &G1Projective) -> G1Projective {
-        let mut out = blst_p1::default();
-
-        unsafe { blst_p1_add_or_double(&mut out, &self.0, &rhs.0) };
-
-        G1Projective(out)
-    }
-
     /// Adds this point to another point in the affine model.
-    pub fn add_mixed(&self, rhs: &G1Affine) -> G1Projective {
+    fn add_mixed(&self, rhs: &G1Affine) -> G1Projective {
         let mut out = blst_p1::default();
 
         unsafe { blst_p1_add_or_double_affine(&mut out, &self.0, &rhs.0) };
@@ -573,17 +588,13 @@ impl G1Projective {
         unsafe { blst_p1_on_curve(&self.0) }
     }
 
-    fn multiply(&self, by: &ScalarRepr) -> G1Projective {
+    fn multiply(&self, scalar: &Scalar) -> G1Projective {
         let mut out = blst_p1::default();
 
-        // Sclar is 255 bits wide.
+        // Scalar is 255 bits wide.
         const NBITS: usize = 255;
 
-        let mut scalar = blst_scalar::default();
-        unsafe {
-            blst_scalar_from_uint64(&mut scalar, by.0.as_ptr());
-            blst_p1_mult(&mut out, &self.0, scalar.b.as_ptr(), NBITS)
-        };
+        unsafe { blst_p1_mult(&mut out, &self.0, scalar.to_bytes_le().as_ptr(), NBITS) };
 
         G1Projective(out)
     }
@@ -615,7 +626,7 @@ impl G1Projective {
 
     /// Hash to curve algorithm.
     pub fn hash_to_curve(msg: &[u8], dst: &[u8], aug: &[u8]) -> Self {
-        let mut res = Self::zero();
+        let mut res = Self::identity();
         unsafe {
             blst_hash_to_g1(
                 &mut res.0,
@@ -631,13 +642,10 @@ impl G1Projective {
     }
 }
 
-impl groupy::CurveProjective for G1Projective {
-    type Engine = crate::Bls12;
+impl Group for G1Projective {
     type Scalar = Scalar;
-    type Base = Fp;
-    type Affine = G1Affine;
 
-    fn random<R: RngCore>(rng: &mut R) -> Self {
+    fn random(mut rng: impl RngCore) -> Self {
         let mut out = blst_p1::default();
         let mut msg = [0u8; 64];
         rng.fill_bytes(&mut msg);
@@ -659,70 +667,26 @@ impl groupy::CurveProjective for G1Projective {
         G1Projective(out)
     }
 
-    fn zero() -> Self {
-        G1Projective(blst_p1::default())
+    fn identity() -> Self {
+        G1Projective::zero()
     }
 
-    fn one() -> Self {
-        G1Projective(unsafe { *blst_p1_generator() })
+    fn generator() -> Self {
+        G1Projective::one()
     }
 
-    fn is_zero(&self) -> bool {
-        unsafe { blst_p1_is_inf(&self.0) }
+    fn is_identity(&self) -> Choice {
+        Choice::from(self.is_zero() as u8)
     }
 
-    fn is_normalized(&self) -> bool {
-        self.is_zero() || self.z() == Fp::one()
+    fn double(&self) -> Self {
+        let mut double = blst_p1::default();
+        unsafe { blst_p1_double(&mut double, &self.0) };
+        G1Projective(double)
     }
+}
 
-    fn batch_normalization<S: std::borrow::BorrowMut<Self>>(v: &mut [S]) {
-        for el in v {
-            let el = el.borrow_mut();
-            let mut tmp = blst_p1_affine::default();
-
-            unsafe {
-                blst_p1_to_affine(&mut tmp, &el.0);
-                blst_p1_from_affine(&mut el.0, &tmp);
-            }
-        }
-    }
-
-    fn double(&mut self) {
-        unsafe { blst_p1_double(&mut self.0, &self.0) };
-    }
-
-    fn add_assign(&mut self, other: &Self) {
-        unsafe { blst_p1_add_or_double(&mut self.0, &self.0, &other.0) };
-    }
-
-    fn add_assign_mixed(&mut self, other: &Self::Affine) {
-        unsafe { blst_p1_add_or_double_affine(&mut self.0, &self.0, &other.0) };
-    }
-
-    fn negate(&mut self) {
-        unsafe { blst_p1_cneg(&mut self.0, true) }
-    }
-
-    fn mul_assign<S: Into<<Self::Scalar as PrimeField>::Repr>>(&mut self, other: S) {
-        *self = self.multiply(&other.into());
-    }
-
-    fn into_affine(&self) -> Self::Affine {
-        (*self).into()
-    }
-
-    fn recommended_wnaf_for_scalar(scalar: <Self::Scalar as PrimeField>::Repr) -> usize {
-        let num_bits = scalar.num_bits() as usize;
-
-        if num_bits >= 130 {
-            4
-        } else if num_bits >= 34 {
-            3
-        } else {
-            2
-        }
-    }
-
+impl WnafGroup for G1Projective {
     fn recommended_wnaf_for_num_scalars(num_scalars: usize) -> usize {
         const RECOMMENDATIONS: [usize; 12] =
             [1, 3, 7, 20, 43, 120, 273, 563, 1630, 3128, 7933, 62569];
@@ -738,9 +702,95 @@ impl groupy::CurveProjective for G1Projective {
 
         ret
     }
+}
 
-    fn hash(_msg: &[u8]) -> Self {
-        unimplemented!("not supported");
+impl PrimeGroup for G1Projective {}
+
+impl Curve for G1Projective {
+    type AffineRepr = G1Affine;
+
+    fn batch_normalize(proj: &[Self], affine: &mut [Self::AffineRepr]) {
+        assert_eq!(proj.len(), affine.len());
+        proj.iter()
+            .zip(affine.iter_mut())
+            .for_each(|(proj, affine)| *affine = proj.into());
+    }
+
+    fn to_affine(&self) -> Self::AffineRepr {
+        self.into()
+    }
+}
+
+impl PrimeCurve for G1Projective {
+    type Affine = G1Affine;
+}
+
+impl PrimeCurveAffine for G1Affine {
+    type Scalar = Scalar;
+    type Curve = G1Projective;
+
+    fn identity() -> Self {
+        G1Affine::zero()
+    }
+
+    fn generator() -> Self {
+        G1Affine::one()
+    }
+
+    fn is_identity(&self) -> Choice {
+        Choice::from(self.is_zero() as u8)
+    }
+
+    fn to_curve(&self) -> Self::Curve {
+        self.into()
+    }
+}
+
+impl GroupEncoding for G1Projective {
+    type Repr = G1Compressed;
+
+    fn from_bytes(bytes: &Self::Repr) -> CtOption<Self> {
+        Self::from_compressed(&bytes.0)
+    }
+
+    fn from_bytes_unchecked(bytes: &Self::Repr) -> CtOption<Self> {
+        Self::from_compressed_unchecked(&bytes.0)
+    }
+
+    fn to_bytes(&self) -> Self::Repr {
+        G1Compressed(self.to_compressed())
+    }
+}
+
+impl GroupEncoding for G1Affine {
+    type Repr = G1Compressed;
+
+    fn from_bytes(bytes: &Self::Repr) -> CtOption<Self> {
+        Self::from_compressed(&bytes.0)
+    }
+
+    fn from_bytes_unchecked(bytes: &Self::Repr) -> CtOption<Self> {
+        Self::from_compressed_unchecked(&bytes.0)
+    }
+
+    fn to_bytes(&self) -> Self::Repr {
+        G1Compressed(self.to_compressed())
+    }
+}
+
+impl UncompressedEncoding for G1Affine {
+    type Uncompressed = G1Uncompressed;
+
+    fn from_uncompressed(bytes: &Self::Uncompressed) -> CtOption<Self> {
+        Self::from_uncompressed(&bytes.0)
+    }
+
+    fn from_uncompressed_unchecked(bytes: &Self::Uncompressed) -> CtOption<Self> {
+        Self::from_uncompressed_unchecked(&bytes.0)
+    }
+
+    fn to_uncompressed(&self) -> Self::Uncompressed {
+        G1Uncompressed(self.to_uncompressed())
     }
 }
 
@@ -749,32 +799,15 @@ pub struct G1Uncompressed([u8; 96]);
 
 encoded_point_delegations!(G1Uncompressed);
 
-impl fmt::Debug for G1Uncompressed {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        self.0[..].fmt(formatter)
+impl Default for G1Uncompressed {
+    fn default() -> Self {
+        G1Uncompressed([0u8; 96])
     }
 }
 
-impl EncodedPoint for G1Uncompressed {
-    type Affine = G1Affine;
-
-    fn empty() -> Self {
-        G1Uncompressed([0; 96])
-    }
-    fn size() -> usize {
-        96
-    }
-    fn into_affine(&self) -> Result<G1Affine, groupy::GroupDecodingError> {
-        G1Affine::from_uncompressed(&self.0).ok_or(groupy::GroupDecodingError::NotInSubgroup)
-    }
-
-    fn into_affine_unchecked(&self) -> Result<G1Affine, groupy::GroupDecodingError> {
-        G1Affine::from_uncompressed_unchecked(&self.0)
-            .ok_or(groupy::GroupDecodingError::UnexpectedInformation)
-    }
-
-    fn from_affine(affine: G1Affine) -> Self {
-        Self(affine.to_uncompressed())
+impl fmt::Debug for G1Uncompressed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        self.0[..].fmt(formatter)
     }
 }
 
@@ -783,26 +816,9 @@ pub struct G1Compressed([u8; 48]);
 
 encoded_point_delegations!(G1Compressed);
 
-impl EncodedPoint for G1Compressed {
-    type Affine = G1Affine;
-
-    fn empty() -> Self {
-        G1Compressed([0; 48])
-    }
-    fn size() -> usize {
-        48
-    }
-    fn into_affine(&self) -> Result<G1Affine, groupy::GroupDecodingError> {
-        G1Affine::from_compressed(&self.0).ok_or(groupy::GroupDecodingError::NotInSubgroup)
-    }
-
-    fn into_affine_unchecked(&self) -> Result<G1Affine, groupy::GroupDecodingError> {
-        G1Affine::from_compressed_unchecked(&self.0)
-            .ok_or(groupy::GroupDecodingError::UnexpectedInformation)
-    }
-
-    fn from_affine(affine: G1Affine) -> Self {
-        G1Compressed(affine.to_compressed())
+impl Default for G1Compressed {
+    fn default() -> Self {
+        G1Compressed([0u8; 48])
     }
 }
 
@@ -812,17 +828,12 @@ impl fmt::Debug for G1Compressed {
     }
 }
 
-impl crate::PairingCurveAffine for G1Affine {
-    type Prepared = G1Affine;
+impl PairingCurveAffine for G1Affine {
     type Pair = G2Affine;
-    type PairingResult = Fp12;
-
-    fn prepare(&self) -> Self::Prepared {
-        *self
-    }
+    type PairingResult = Gt;
 
     fn pairing_with(&self, other: &Self::Pair) -> Self::PairingResult {
-        self.perform_pairing(other)
+        <Bls12 as Engine>::pairing(self, other)
     }
 }
 
@@ -832,8 +843,7 @@ mod tests {
 
     use super::*;
 
-    use fff::Field;
-    use groupy::{CurveAffine, CurveProjective};
+    use ff::Field;
     use rand_core::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
@@ -854,7 +864,7 @@ mod tests {
         // Doubling edge case with zero.
         {
             let mut z = G1Projective::zero();
-            z.double();
+            z = z.double();
             assert!(z.is_zero());
         }
 
@@ -911,8 +921,7 @@ mod tests {
         ]);
 
         let gen = G1Affine::one();
-        let mut z2 = z;
-        z2.square();
+        let z2 = z.square();
         let mut test = G1Projective::from_raw_unchecked(gen.x() * z2, gen.y() * (z2 * z), z);
 
         assert!(test.is_on_curve());
@@ -926,10 +935,10 @@ mod tests {
         let a = G1Affine::one();
         let b = G1Affine::zero();
 
-        assert!(a == a);
-        assert!(b == b);
-        assert!(a != b);
-        assert!(b != a);
+        assert_eq!(a, a);
+        assert_eq!(b, b);
+        assert_ne!(a, b);
+        assert_ne!(b, a);
     }
 
     #[test]
@@ -937,10 +946,10 @@ mod tests {
         let a = G1Projective::one();
         let b = G1Projective::zero();
 
-        assert!(a == a);
-        assert!(b == b);
-        assert!(a != b);
-        assert!(b != a);
+        assert_eq!(a, a);
+        assert_eq!(b, b);
+        assert_ne!(a, b);
+        assert_ne!(b, a);
 
         let z = Fp::from_raw_unchecked([
             0xba7afa1f9a6fe250,
@@ -951,30 +960,29 @@ mod tests {
             0x12b108ac33643c3e,
         ]);
 
-        let mut z2 = z;
-        z2.square();
+        let z2 = z.square();
         let mut c = G1Projective::from_raw_unchecked(a.x() * z2, a.y() * (z2 * z), z);
         assert!(c.is_on_curve());
 
-        assert!(a == c);
-        assert!(b != c);
-        assert!(c == a);
-        assert!(c != b);
+        assert_eq!(a, c);
+        assert_eq!(c, a);
+        assert_ne!(b, c);
+        assert_ne!(c, b);
 
         c.0.y = (-c.y()).0;
         assert!(c.is_on_curve());
 
-        assert!(a != c);
-        assert!(b != c);
-        assert!(c != a);
-        assert!(c != b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert_ne!(c, a);
+        assert_ne!(c, b);
 
         c.0.y = (-c.y()).0;
         c.0.x = z.0;
         assert!(!c.is_on_curve());
-        assert!(a != b);
-        assert!(a != c);
-        assert!(b != c);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
     }
 
     #[test]
@@ -996,8 +1004,7 @@ mod tests {
             0x12b108ac33643c3e,
         ]);
 
-        let mut z2 = z;
-        z2.square();
+        let z2 = z.square();
         let c = G1Projective::from_raw_unchecked(a.x() * z2, a.y() * (z2 * z), z);
 
         assert_eq!(G1Affine::from(c), G1Affine::one());
@@ -1017,14 +1024,12 @@ mod tests {
     #[test]
     fn test_doubling() {
         {
-            let mut tmp = G1Projective::zero();
-            tmp.double();
+            let tmp = G1Projective::zero().double();
             assert!(tmp.is_zero());
             assert!(tmp.is_on_curve());
         }
         {
-            let mut tmp = G1Projective::one();
-            tmp.double();
+            let tmp = G1Projective::one().double();
             assert!(!tmp.is_zero());
             assert!(tmp.is_on_curve());
 
@@ -1075,14 +1080,13 @@ mod tests {
                     0x12b108ac33643c3e,
                 ]);
 
-                let mut z2 = z;
-                z2.square();
+                let z2 = z.square();
                 b = G1Projective::from_raw_unchecked(b.x() * (z2), b.y() * (z2 * z), z);
             }
             let c = a + b;
             assert!(!c.is_zero());
             assert!(c.is_on_curve());
-            assert!(c == G1Projective::one());
+            assert_eq!(c, G1Projective::one());
         }
         {
             let a = G1Projective::zero();
@@ -1097,21 +1101,17 @@ mod tests {
                     0x12b108ac33643c3e,
                 ]);
 
-                let mut z2 = z;
-                z2.square();
+                let z2 = z.square();
                 b = G1Projective::from_raw_unchecked(b.x() * (z2), b.y() * (z2 * z), z);
             }
             let c = b + a;
             assert!(!c.is_zero());
             assert!(c.is_on_curve());
-            assert!(c == G1Projective::one());
+            assert_eq!(c, G1Projective::one());
         }
         {
-            let mut a = G1Projective::one();
-            a.double();
-            a.double(); // 4P
-            let mut b = G1Projective::one();
-            b.double(); // 2P
+            let a = G1Projective::one().double().double(); // 4P
+            let b = G1Projective::one().double(); // 2P
             let c = a + b;
 
             let mut d = G1Projective::one();
@@ -1135,10 +1135,8 @@ mod tests {
                 0x3f97d6e83d050d2,
                 0x18f0206554638741,
             ]);
-            beta.square();
-            let mut a = G1Projective::one();
-            a.double();
-            a.double();
+            beta = beta.square();
+            let a = G1Projective::one().double().double();
             let b = G1Projective::from_raw_unchecked(a.x() * beta, -a.y(), a.z());
             assert!(a.is_on_curve());
             assert!(b.is_on_curve());
@@ -1193,14 +1191,13 @@ mod tests {
                     0x12b108ac33643c3e,
                 ]);
 
-                let mut z2 = z;
-                z2.square();
+                let z2 = z.square();
                 b = G1Projective::from_raw_unchecked(b.x() * (z2), b.y() * (z2 * z), z);
             }
             let c = a + b;
             assert!(!c.is_zero());
             assert!(c.is_on_curve());
-            assert!(c == G1Projective::one());
+            assert_eq!(c, G1Projective::one());
         }
         {
             let a = G1Affine::zero();
@@ -1215,21 +1212,17 @@ mod tests {
                     0x12b108ac33643c3e,
                 ]);
 
-                let mut z2 = z;
-                z2.square();
+                let z2 = z.square();
                 b = G1Projective::from_raw_unchecked(b.x() * (z2), b.y() * (z2 * z), z);
             }
             let c = b + a;
             assert!(!c.is_zero());
             assert!(c.is_on_curve());
-            assert!(c == G1Projective::one());
+            assert_eq!(c, G1Projective::one());
         }
         {
-            let mut a = G1Projective::one();
-            a.double();
-            a.double(); // 4P
-            let mut b = G1Projective::one();
-            b.double(); // 2P
+            let a = G1Projective::one().double().double(); // 4P
+            let b = G1Projective::one().double(); // 2P
             let c = a + b;
 
             let mut d = G1Projective::one();
@@ -1253,10 +1246,8 @@ mod tests {
                 0x3f97d6e83d050d2,
                 0x18f0206554638741,
             ]);
-            beta.square();
-            let mut a = G1Projective::one();
-            a.double();
-            a.double();
+            beta = beta.square();
+            let a = G1Projective::one().double().double();
             let b = G1Projective::from_raw_unchecked(a.x() * beta, -a.y(), a.z());
             let a = G1Affine::from(a);
             assert!(a.is_on_curve());
@@ -1292,8 +1283,7 @@ mod tests {
 
     #[test]
     fn test_projective_negation_and_subtraction() {
-        let mut a = G1Projective::one();
-        a.double();
+        let a = G1Projective::one().double();
         assert_eq!(a + (-a), G1Projective::zero());
         assert_eq!(a + (-a), a - a);
     }
@@ -1354,8 +1344,8 @@ mod tests {
     }
 
     #[test]
-    fn groupy_g1_curve_tests() {
-        use groupy::tests::curve_tests;
+    fn g1_curve_tests() {
+        use group::tests::curve_tests;
         curve_tests::<G1Projective>();
     }
 

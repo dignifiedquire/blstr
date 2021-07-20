@@ -15,13 +15,15 @@ rustdoc-args = [ "--html-in-header", "katex-header.html" ]
 
 [dependencies]
 blst = { version = "=0.3.3", default-features = true }
-rand_core = "0.5.1"
-fff = "0.3.0"
-groupy = "0.4.1"
+rand_core = "0.6"
+ff = "0.10"
+group = { version = "0.10", features = ["tests"] }
+pairing_lib = { version = "0.20", package = "pairing" }
 serde = { version = "1.0", features = ["derive"] }
+subtle = "2.2.1"
 
 [dev-dependencies]
-rand_xorshift = "0.2.0"
+rand_xorshift = "0.3.0"
 serde_json = "1.0.57"
 hex = "0.4.2"
 

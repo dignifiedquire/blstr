@@ -9,18 +9,77 @@ use core::{
     fmt, mem,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
-use fff::{Field, PrimeField};
+use ff::Field;
+use rand_core::RngCore;
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 use crate::Fp2;
 
-/// `Fp` values are always in
-/// Montgomery form; i.e., Scalar(a) = aR mod p, with R = 2^384.
+// Little-endian non-Montgomery form.
+#[allow(dead_code)]
+const MODULUS: [u64; 6] = [
+    0xb9fe_ffff_ffff_aaab,
+    0x1eab_fffe_b153_ffff,
+    0x6730_d2a0_f6b0_f624,
+    0x6477_4b84_f385_12bf,
+    0x4b1b_a7b6_434b_acd7,
+    0x1a01_11ea_397f_e69a,
+];
+
+// Little-endian non-Montgomery form.
+const MODULUS_REPR: [u8; 48] = [
+    0xab, 0xaa, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xb9, 0xff, 0xff, 0x53, 0xb1, 0xfe, 0xff, 0xab, 0x1e,
+    0x24, 0xf6, 0xb0, 0xf6, 0xa0, 0xd2, 0x30, 0x67, 0xbf, 0x12, 0x85, 0xf3, 0x84, 0x4b, 0x77, 0x64,
+    0xd7, 0xac, 0x4b, 0x43, 0xb6, 0xa7, 0x1b, 0x4b, 0x9a, 0xe6, 0x7f, 0x39, 0xea, 0x11, 0x01, 0x1a,
+];
+
+// `2^S` root of unity in little-endian non-Montgomery form.
+const ROOT_OF_UNITY_REPR: [u8; 48] = [
+    0xaa, 0xaa, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xb9, 0xff, 0xff, 0x53, 0xb1, 0xfe, 0xff, 0xab, 0x1e,
+    0x24, 0xf6, 0xb0, 0xf6, 0xa0, 0xd2, 0x30, 0x67, 0xbf, 0x12, 0x85, 0xf3, 0x84, 0x4b, 0x77, 0x64,
+    0xd7, 0xac, 0x4b, 0x43, 0xb6, 0xa7, 0x1b, 0x4b, 0x9a, 0xe6, 0x7f, 0x39, 0xea, 0x11, 0x01, 0x1a,
+];
+
+/// R = 2^384 mod p
+const R: Fp = Fp(blst_fp {
+    l: [
+        0x7609_0000_0002_fffd,
+        0xebf4_000b_c40c_0002,
+        0x5f48_9857_53c7_58ba,
+        0x77ce_5853_7052_5745,
+        0x5c07_1a97_a256_ec6d,
+        0x15f6_5ec3_fa80_e493,
+    ],
+});
+
+/// R2 = 2^(384*2) mod p
+const R2: Fp = Fp(blst_fp {
+    l: [
+        0xf4df_1f34_1c34_1746,
+        0x0a76_e6a6_09d1_04f1,
+        0x8de5_476c_4c95_b6d5,
+        0x67eb_88a9_939d_83c0,
+        0x9a79_3e85_b519_952d,
+        0x1198_8fe5_92ca_e3aa,
+    ],
+});
+
+/// R3 = 2^(384*3) mod p
+const R3: Fp = Fp(blst_fp {
+    l: [
+        0xed48_ac6b_d94c_a1e0,
+        0x315f_831e_03a7_adf8,
+        0x9a53_352a_615e_29dd,
+        0x34c0_4e5e_921e_1761,
+        0x2512_d435_6572_4728,
+        0x0aa6_3460_9175_5d4d,
+    ],
+});
+
+/// `Fp` values are always in Montgomery form; i.e., Fp(a) = aR mod p, with R = 2^384. `blst_fp.l`
+/// is in little-endian `u64` limbs format.
 #[derive(Copy, Clone)]
 pub struct Fp(pub(crate) blst_fp);
-
-/// Representation of a `Fp`, in regular coordinates.
-#[derive(Default, Clone, Copy)]
-pub struct FpRepr(pub [u64; 6]);
 
 // -((2**384) mod q) mod q
 pub(crate) const NEGATIVE_ONE: Fp = Fp(blst_fp {
@@ -258,203 +317,24 @@ pub const FROBENIUS_COEFF_FP6_C2: [Fp2; 6] = [
     ),
 ];
 
-impl AsRef<[u64]> for FpRepr {
-    fn as_ref(&self) -> &[u64] {
-        &self.0
-    }
-}
-
-impl AsMut<[u64]> for FpRepr {
-    fn as_mut(&mut self) -> &mut [u64] {
-        &mut self.0
-    }
-}
-
-const LIMBS: usize = 6;
-const LIMB_BITS: usize = 64;
-
-impl fmt::Debug for FpRepr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "0x")?;
-        for &b in self.0.iter().rev() {
-            write!(f, "{:016x}", b)?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for FpRepr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "0x")?;
-        for &b in self.0.iter().rev() {
-            write!(f, "{:016x}", b)?;
-        }
-        Ok(())
-    }
-}
-
-impl From<u64> for FpRepr {
-    fn from(val: u64) -> FpRepr {
-        FpRepr([val, 0, 0, 0, 0, 0])
-    }
-}
-
 impl From<u64> for Fp {
     fn from(val: u64) -> Fp {
-        Fp::from_repr(FpRepr::from(val)).expect("single u64 is always less than the modulus")
+        let mut repr = [0u8; 48];
+        repr[..8].copy_from_slice(&val.to_le_bytes());
+        Self::from_bytes_le(&repr).unwrap()
     }
 }
 
-impl Ord for FpRepr {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        for (a, b) in self.0.iter().rev().zip(other.0.iter().rev()) {
-            match a.cmp(b) {
-                cmp::Ordering::Greater => {
-                    return cmp::Ordering::Greater;
-                }
-                cmp::Ordering::Less => {
-                    return cmp::Ordering::Less;
-                }
-                cmp::Ordering::Equal => {}
-            }
-        }
-
-        cmp::Ordering::Equal
-    }
-}
-
-impl PartialOrd for FpRepr {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for FpRepr {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl Eq for FpRepr {}
-
-impl fff::PrimeFieldRepr for FpRepr {
-    fn sub_noborrow(&mut self, other: &Self) {
-        let mut borrow = 0;
-
-        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
-            *a = fff::sbb(*a, *b, &mut borrow);
-        }
-    }
-
-    fn add_nocarry(&mut self, other: &Self) {
-        let mut carry = 0;
-
-        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
-            *a = fff::adc(*a, *b, &mut carry);
-        }
-    }
-
-    fn num_bits(&self) -> u32 {
-        let mut ret = (LIMBS as u32) * LIMB_BITS as u32;
-        for i in self.0.iter().rev() {
-            let leading = i.leading_zeros();
-            ret -= leading;
-            if leading != LIMB_BITS as u32 {
-                break;
-            }
-        }
-
-        ret
-    }
-
-    fn is_zero(&self) -> bool {
-        self.0.iter().all(|&e| e == 0)
-    }
-
-    fn is_odd(&self) -> bool {
-        self.0[0] & 1 == 1
-    }
-
-    fn is_even(&self) -> bool {
-        !self.is_odd()
-    }
-
-    fn div2(&mut self) {
-        let mut t = 0;
-        for i in self.0.iter_mut().rev() {
-            let t2 = *i << 63;
-            *i >>= 1;
-            *i |= t;
-            t = t2;
-        }
-    }
-
-    fn shr(&mut self, mut n: u32) {
-        if n as usize >= LIMB_BITS * LIMBS {
-            *self = Self::from(0);
-            return;
-        }
-
-        while n >= LIMB_BITS as u32 {
-            let mut t = 0;
-            for i in self.0.iter_mut().rev() {
-                mem::swap(&mut t, i);
-            }
-            n -= LIMB_BITS as u32;
-        }
-
-        if n > 0 {
-            let mut t = 0;
-            for i in self.0.iter_mut().rev() {
-                let t2 = *i << (LIMB_BITS as u32 - n);
-                *i >>= n;
-                *i |= t;
-                t = t2;
-            }
-        }
-    }
-
-    fn mul2(&mut self) {
-        let mut last = 0;
-        for i in &mut self.0 {
-            let tmp = *i >> 63;
-            *i <<= 1;
-            *i |= last;
-            last = tmp;
-        }
-    }
-
-    fn shl(&mut self, mut n: u32) {
-        if n as usize >= LIMB_BITS * LIMBS {
-            *self = Self::from(0);
-            return;
-        }
-
-        while n >= LIMB_BITS as u32 {
-            let mut t = 0;
-            for i in &mut self.0 {
-                mem::swap(&mut t, i);
-            }
-            n -= LIMB_BITS as u32;
-        }
-
-        if n > 0 {
-            let mut t = 0;
-            for i in &mut self.0 {
-                let t2 = *i >> (LIMB_BITS as u32 - n);
-                *i <<= n;
-                *i |= t;
-                t = t2;
-            }
-        }
-    }
-}
-
-/// Elements are ordered lexicographically.
 impl Ord for Fp {
-    #[inline(always)]
     fn cmp(&self, other: &Fp) -> cmp::Ordering {
-        self.into_repr().cmp(&other.into_repr())
+        for (a, b) in self.to_bytes_be().iter().zip(other.to_bytes_be().iter()) {
+            if a > b {
+                return cmp::Ordering::Greater;
+            } else if a < b {
+                return cmp::Ordering::Less;
+            }
+        }
+        cmp::Ordering::Equal
     }
 }
 
@@ -467,9 +347,9 @@ impl PartialOrd for Fp {
 
 impl fmt::Debug for Fp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let tmp = self.to_bytes_le();
+        let be_bytes = self.to_bytes_be();
         write!(f, "Fp(0x")?;
-        for &b in tmp.iter().rev() {
+        for &b in be_bytes.iter() {
             write!(f, "{:02x}", b)?;
         }
         write!(f, ")")?;
@@ -479,21 +359,7 @@ impl fmt::Debug for Fp {
 
 impl fmt::Display for Fp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let tmp = self.to_bytes_le();
-        write!(f, "Fp(0x")?;
-        for &b in tmp.iter().rev() {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, ")")?;
-        Ok(())
-    }
-}
-
-impl From<Fp> for FpRepr {
-    fn from(val: Fp) -> Self {
-        let mut out = FpRepr::default();
-        unsafe { blst_uint64_from_fp(out.0.as_mut_ptr(), &val.0) };
-        out
+        write!(f, "{:?}", self)
     }
 }
 
@@ -529,12 +395,40 @@ impl PartialEq for Fp {
     }
 }
 
-impl<'a> Neg for &'a Fp {
+impl ConstantTimeEq for Fp {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.l[0].ct_eq(&other.0.l[0])
+            & self.0.l[1].ct_eq(&other.0.l[1])
+            & self.0.l[2].ct_eq(&other.0.l[2])
+            & self.0.l[3].ct_eq(&other.0.l[3])
+            & self.0.l[4].ct_eq(&other.0.l[4])
+            & self.0.l[5].ct_eq(&other.0.l[5])
+    }
+}
+
+impl ConditionallySelectable for Fp {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        Fp(blst_fp {
+            l: [
+                u64::conditional_select(&a.0.l[0], &b.0.l[0], choice),
+                u64::conditional_select(&a.0.l[1], &b.0.l[1], choice),
+                u64::conditional_select(&a.0.l[2], &b.0.l[2], choice),
+                u64::conditional_select(&a.0.l[3], &b.0.l[3], choice),
+                u64::conditional_select(&a.0.l[4], &b.0.l[4], choice),
+                u64::conditional_select(&a.0.l[5], &b.0.l[5], choice),
+            ],
+        })
+    }
+}
+
+impl Neg for &Fp {
     type Output = Fp;
 
     #[inline]
     fn neg(self) -> Fp {
-        self.neg()
+        let mut neg = blst_fp::default();
+        unsafe { blst_fp_cneg(&mut neg, &self.0, true) };
+        Fp(neg)
     }
 }
 
@@ -547,52 +441,94 @@ impl Neg for Fp {
     }
 }
 
-impl<'a, 'b> Sub<&'b Fp> for &'a Fp {
+impl Sub<&Fp> for &Fp {
     type Output = Fp;
 
     #[inline]
-    fn sub(self, rhs: &'b Fp) -> Fp {
-        self.sub(rhs)
+    fn sub(self, rhs: &Fp) -> Fp {
+        let mut out = blst_fp::default();
+        unsafe { blst_fp_sub(&mut out, &self.0, &rhs.0) };
+        Fp(out)
     }
 }
 
-impl<'a, 'b> Add<&'b Fp> for &'a Fp {
+impl Add<&Fp> for &Fp {
     type Output = Fp;
 
     #[inline]
-    fn add(self, rhs: &'b Fp) -> Fp {
-        self.add(rhs)
+    fn add(self, rhs: &Fp) -> Fp {
+        let mut out = blst_fp::default();
+        unsafe { blst_fp_add(&mut out, &self.0, &rhs.0) };
+        Fp(out)
     }
 }
 
-impl<'a, 'b> Mul<&'b Fp> for &'a Fp {
+impl Mul<&Fp> for &Fp {
     type Output = Fp;
 
     #[inline]
-    fn mul(self, rhs: &'b Fp) -> Fp {
-        self.mul(rhs)
+    fn mul(self, rhs: &Fp) -> Fp {
+        let mut out = blst_fp::default();
+        unsafe { blst_fp_mul(&mut out, &self.0, &rhs.0) };
+        Fp(out)
     }
 }
 
-impl_binops_additive!(Fp, Fp, fff::Field);
-impl_binops_multiplicative!(Fp, Fp, fff::Field);
+impl AddAssign<&Fp> for Fp {
+    #[inline]
+    fn add_assign(&mut self, rhs: &Fp) {
+        unsafe { blst_fp_add(&mut self.0, &self.0, &rhs.0) };
+    }
+}
+
+impl SubAssign<&Fp> for Fp {
+    #[inline]
+    fn sub_assign(&mut self, rhs: &Fp) {
+        unsafe { blst_fp_sub(&mut self.0, &self.0, &rhs.0) };
+    }
+}
+
+impl MulAssign<&Fp> for Fp {
+    #[inline]
+    fn mul_assign(&mut self, rhs: &Fp) {
+        unsafe { blst_fp_mul(&mut self.0, &self.0, &rhs.0) };
+    }
+}
+
+impl_add_sub!(Fp);
+impl_add_sub_assign!(Fp);
+impl_mul!(Fp);
+impl_mul_assign!(Fp);
+
+// Returns `true` if  `le_bytes` is less than the modulus (both are in non-Montgomery form).
+fn is_valid(le_bytes: &[u8; 48]) -> bool {
+    for (a, b) in le_bytes.iter().zip(MODULUS_REPR.iter()).rev() {
+        if a > b {
+            return false;
+        } else if a < b {
+            return true;
+        }
+    }
+    // Return `false` if `le_bytes` is the modulus.
+    false
+}
 
 /// The number of bits we should "shave" from a randomly sampled reputation.
 const REPR_SHAVE_BITS: usize = 384 - Fp::NUM_BITS as usize;
 
-impl fff::Field for Fp {
-    fn random<R: rand_core::RngCore>(rng: &mut R) -> Self {
+impl Field for Fp {
+    fn random(mut rng: impl RngCore) -> Self {
         loop {
-            let mut raw = blst_fp::default();
+            let mut raw = [0u64; 6];
             for i in 0..6 {
-                raw.l[i] = rng.next_u64();
+                raw[i] = rng.next_u64();
             }
 
             // Mask away the unused most-significant bits.
-            raw.l[5] &= 0xffffffffffffffff >> REPR_SHAVE_BITS;
+            raw[5] &= 0xffffffffffffffff >> REPR_SHAVE_BITS;
 
-            if FpRepr(raw.l) < MODULUS {
-                return Fp(raw);
+            if let Some(fp) = Fp::from_u64s_le(&raw) {
+                return fp;
             }
         }
     }
@@ -603,167 +539,37 @@ impl fff::Field for Fp {
         })
     }
 
+    // Returns `1 mod p` in Montgomery form `1 * R mod p`;
     fn one() -> Self {
-        Fp(blst_fp {
-            l: [
-                0x760900000002fffd,
-                0xebf4000bc40c0002,
-                0x5f48985753c758ba,
-                0x77ce585370525745,
-                0x5c071a97a256ec6d,
-                0x15f65ec3fa80e493,
-            ],
-        })
+        R
     }
 
     fn is_zero(&self) -> bool {
-        self == &Self::zero()
+        self.0.l == [0, 0, 0, 0, 0, 0]
     }
 
-    fn square(&mut self) {
-        let mut raw = blst_fp::default();
-        unsafe { blst_fp_sqr(&mut raw, &self.0) }
-
-        self.0 = raw;
+    fn square(&self) -> Self {
+        let mut sq = blst_fp::default();
+        unsafe { blst_fp_sqr(&mut sq, &self.0) }
+        Fp(sq)
     }
 
-    fn double(&mut self) {
-        unsafe { blst_fp_add(&mut self.0, &self.0, &self.0) };
+    fn double(&self) -> Self {
+        self + self
     }
 
-    fn negate(&mut self) {
-        unsafe { blst_fp_cneg(&mut self.0, &self.0, true) };
+    fn invert(&self) -> CtOption<Self> {
+        let mut inv = blst_fp::default();
+        unsafe { blst_fp_eucl_inverse(&mut inv, &self.0) };
+        let is_invertible = !self.ct_eq(&Fp::zero());
+        CtOption::new(Fp(inv), is_invertible)
     }
 
-    fn add_assign(&mut self, other: &Self) {
-        unsafe { blst_fp_add(&mut self.0, &self.0, &other.0) };
-    }
-
-    fn sub_assign(&mut self, other: &Self) {
-        unsafe { blst_fp_sub(&mut self.0, &self.0, &other.0) };
-    }
-
-    fn mul_assign(&mut self, other: &Self) {
-        unsafe { blst_fp_mul(&mut self.0, &self.0, &other.0) };
-    }
-
-    fn inverse(&self) -> Option<Self> {
-        if self.is_zero() {
-            return None;
-        }
-
-        let mut out = blst_fp::default();
-
-        unsafe { blst_fp_eucl_inverse(&mut out, &self.0) };
-
-        Some(Fp(out))
-    }
-
-    fn frobenius_map(&mut self, _: usize) {
-        // This has no effect in a prime field.
-    }
-}
-
-const MODULUS: FpRepr = FpRepr([
-    0xb9feffffffffaaab,
-    0x1eabfffeb153ffff,
-    0x6730d2a0f6b0f624,
-    0x64774b84f38512bf,
-    0x4b1ba7b6434bacd7,
-    0x1a0111ea397fe69a,
-]);
-
-impl FpRepr {
-    pub const fn new(raw: [u64; 6]) -> Self {
-        FpRepr(raw)
-    }
-}
-
-impl fff::PrimeField for Fp {
-    type Repr = FpRepr;
-
-    const NUM_BITS: u32 = 381;
-    const CAPACITY: u32 = Self::NUM_BITS - 1;
-    const S: u32 = 1;
-
-    fn from_repr(repr: Self::Repr) -> Result<Self, fff::PrimeFieldDecodingError> {
-        if FpRepr(repr.0) < MODULUS {
-            let mut out = blst_fp::default();
-            unsafe { blst_fp_from_uint64(&mut out, repr.0.as_ptr()) }
-            Ok(Fp(out))
-        } else {
-            Err(fff::PrimeFieldDecodingError::NotInField(
-                "not in field".to_string(),
-            ))
-        }
-    }
-
-    /// Convert a biginteger representation into a prime field element, if
-    /// the number is an element of the field.
-    fn into_repr(&self) -> Self::Repr {
-        (*self).into()
-    }
-
-    fn char() -> Self::Repr {
-        MODULUS
-    }
-
-    fn multiplicative_generator() -> Self {
-        Fp::from_repr(FpRepr([2, 0, 0, 0, 0, 0])).unwrap()
-    }
-
-    fn root_of_unity() -> Self {
-        Fp::from_repr(FpRepr([
-            13402431016077863594,
-            2210141511517208575,
-            7435674573564081700,
-            7239337960414712511,
-            5412103778470702295,
-            1873798617647539866,
-        ]))
-        .unwrap()
-    }
-
-    fn from_random_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut repr = FpRepr::default();
-
-        for (limb, chunk) in repr.0.iter_mut().zip(bytes.chunks_exact(8)) {
-            *limb = u64::from_le_bytes(chunk.try_into().unwrap());
-        }
-
-        // Mask away the unused most-significant bits.
-        repr.0[5] &= 0xffffffffffffffff >> REPR_SHAVE_BITS;
-
-        Fp::from_repr(repr).ok()
-    }
-}
-
-impl fff::SqrtField for Fp {
-    fn legendre(&self) -> fff::LegendreSymbol {
-        const MOD_MINUS_1_OVER_2: [u64; 6] = [
-            15924587544893707605,
-            1105070755758604287,
-            12941209323636816658,
-            12843041017062132063,
-            2706051889235351147,
-            936899308823769933,
-        ];
-        // s = self^((modulus - 1) // 2)
-        let s = self.pow(MOD_MINUS_1_OVER_2);
-        if s == Self::zero() {
-            ::fff::LegendreSymbol::Zero
-        } else if s == Self::one() {
-            ::fff::LegendreSymbol::QuadraticResidue
-        } else {
-            ::fff::LegendreSymbol::QuadraticNonResidue
-        }
-    }
-
-    fn sqrt(&self) -> Option<Self> {
+    fn sqrt(&self) -> CtOption<Self> {
         // Shank's algorithm for q mod 4 = 3
         // https://eprint.iacr.org/2012/685.pdf (page 9, algorithm 2)
 
-        let mut a1 = self.pow(&[
+        let mut a1 = self.pow_vartime(&[
             17185665809301629610u64,
             552535377879302143u64,
             15693976698673184137u64,
@@ -773,7 +579,7 @@ impl fff::SqrtField for Fp {
         ]);
 
         let mut a0 = a1;
-        a0.square();
+        a0 = a0.square();
         a0 *= self;
 
         const RNEG: [u64; 6] = [
@@ -785,104 +591,124 @@ impl fff::SqrtField for Fp {
             291242102765847046u64,
         ];
 
-        if a0.0.l == RNEG {
-            None
-        } else {
-            a1 *= self;
-            Some(a1)
-        }
+        let is_quad_res = !a0.ct_eq(&Fp(blst_fp { l: RNEG }));
+        a1 *= self;
+        CtOption::new(a1, is_quad_res)
     }
 }
 
+// We cannot implement `fff::PrimeField` for `Fp` because its repr `[u8; 48]` does not implement
+// `Default`
 impl Fp {
+    pub const NUM_BITS: u32 = 381;
+    pub const CAPACITY: u32 = Self::NUM_BITS - 1;
+    pub const S: u32 = 1;
+
+    /// Interpret a string of numbers as a (congruent) prime field element.
+    /// Does not accept unnecessary leading zeroes or a blank string.
+    fn from_str(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return None;
+        }
+
+        if s == "0" {
+            return Some(Self::zero());
+        }
+
+        let mut res = Self::zero();
+
+        let ten = Self::from(10);
+
+        let mut first_digit = true;
+
+        for c in s.chars() {
+            match c.to_digit(10) {
+                Some(c) => {
+                    if first_digit {
+                        if c == 0 {
+                            return None;
+                        }
+
+                        first_digit = false;
+                    }
+
+                    res.mul_assign(&ten);
+                    res.add_assign(&Self::from(u64::from(c)));
+                }
+                None => {
+                    return None;
+                }
+            }
+        }
+
+        Some(res)
+    }
+
+    /// Converts a non-Montgomery form little-endian bigint to Montgomery form.
+    pub fn from_repr(repr: [u8; 48]) -> Option<Self> {
+        Self::from_bytes_le(&repr)
+    }
+
+    /// Converts `self` from Montgomery form into a little-endian bigint in non-Montgomery form.
+    pub fn to_repr(&self) -> [u8; 48] {
+        self.to_bytes_le()
+    }
+
+    pub fn is_odd(&self) -> bool {
+        self.to_repr()[0] & 1 == 1
+    }
+
+    pub fn multiplicative_generator() -> Self {
+        Fp::from(2)
+    }
+
+    pub fn root_of_unity() -> Self {
+        Fp::from_repr(ROOT_OF_UNITY_REPR).unwrap()
+    }
+
+    pub fn char() -> [u8; 48] {
+        MODULUS_REPR
+    }
+
     /// Attempts to convert a little-endian byte representation of
     /// a scalar into an `Fp`, failing if the input is not canonical.
     pub fn from_bytes_le(bytes: &[u8; 48]) -> Option<Fp> {
-        let mut raw = blst_fp::default();
-
-        unsafe {
-            blst_fp_from_lendian(&mut raw, bytes.as_ptr());
+        if !is_valid(bytes) {
+            return None;
         }
-
-        Some(Fp(raw))
+        let mut out = blst_fp::default();
+        unsafe { blst_fp_from_lendian(&mut out, bytes.as_ptr()) };
+        Some(Fp(out))
     }
 
     /// Attempts to convert a big-endian byte representation of
     /// a scalar into an `Fp`, failing if the input is not canonical.
-    pub fn from_bytes_be(bytes: &[u8; 48]) -> Option<Fp> {
-        let mut raw = blst_fp::default();
-
-        unsafe {
-            blst_fp_from_bendian(&mut raw, bytes.as_ptr());
-        }
-
-        Some(Fp(raw))
+    pub fn from_bytes_be(be_bytes: &[u8; 48]) -> Option<Fp> {
+        let mut le_bytes = *be_bytes;
+        le_bytes.reverse();
+        Self::from_bytes_le(&le_bytes)
     }
 
     /// Converts an element of `Fp` into a byte representation in
     /// little-endian byte order.
     pub fn to_bytes_le(&self) -> [u8; 48] {
-        let mut out = [0u8; 48];
-
-        unsafe {
-            blst_lendian_from_fp(out.as_mut_ptr(), &self.0);
-        }
-
-        out
+        let mut repr = [0u8; 48];
+        unsafe { blst_lendian_from_fp(repr.as_mut_ptr(), &self.0) };
+        repr
     }
 
     /// Converts an element of `Fp` into a byte representation in
     /// big-endian byte order.
     pub fn to_bytes_be(&self) -> [u8; 48] {
-        let mut out = [0u8; 48];
-
-        unsafe {
-            blst_bendian_from_fp(out.as_mut_ptr(), &self.0);
-        }
-
-        out
+        let mut bytes = self.to_bytes_le();
+        bytes.reverse();
+        bytes
     }
 
-    /// Constructs an element of `Fp` without checking that it is canonical.
-    pub fn from_raw_unchecked(v: [u64; 6]) -> Fp {
-        let mut inner = blst_fp::default();
-        inner.l.copy_from_slice(&v);
-        Fp(inner)
-    }
-
-    #[inline]
-    pub fn add(&self, rhs: &Fp) -> Fp {
-        let mut out = blst_fp::default();
-
-        unsafe { blst_fp_add(&mut out, &self.0, &rhs.0) };
-
-        Fp(out)
-    }
-
-    #[inline]
-    pub fn neg(&self) -> Fp {
-        let mut out = *self;
-        out.negate();
-
-        out
-    }
-
-    #[inline]
-    pub fn sub(&self, rhs: &Fp) -> Fp {
-        let mut out = blst_fp::default();
-
-        unsafe { blst_fp_sub(&mut out, &self.0, &rhs.0) };
-
-        Fp(out)
-    }
-
-    #[inline]
-    pub fn mul(&self, rhs: &Fp) -> Fp {
-        let mut out = blst_fp::default();
-
-        unsafe { blst_fp_mul(&mut out, &self.0, &rhs.0) };
-
-        Fp(out)
+    /// Constructs an element of `Fp` from a little-endian array of limbs without checking that it
+    /// is canonical and without converting it to Montgomery form (i.e. without multiplying by `R`).
+    pub fn from_raw_unchecked(l: [u64; 6]) -> Fp {
+        Fp(blst_fp { l })
     }
 
     /// Multiplies `self` with `3`, returning the result.
@@ -911,29 +737,64 @@ impl Fp {
 
         Fp(out)
     }
+
+    // `u64s` represent a little-endian non-Montgomery form integer mod p.
+    pub fn from_u64s_le(u64s: &[u64; 6]) -> Option<Self> {
+        let mut le_bytes = [0u8; 48];
+        le_bytes[..8].copy_from_slice(&u64s[0].to_le_bytes());
+        le_bytes[8..16].copy_from_slice(&u64s[1].to_le_bytes());
+        le_bytes[16..24].copy_from_slice(&u64s[2].to_le_bytes());
+        le_bytes[24..32].copy_from_slice(&u64s[3].to_le_bytes());
+        le_bytes[32..40].copy_from_slice(&u64s[4].to_le_bytes());
+        le_bytes[40..].copy_from_slice(&u64s[5].to_le_bytes());
+        Fp::from_bytes_le(&le_bytes)
+    }
+
+    pub fn num_bits(&self) -> u32 {
+        let mut ret = 384;
+        for i in self.to_bytes_be().iter() {
+            let leading = i.leading_zeros();
+            ret -= leading;
+            if leading != 8 {
+                break;
+            }
+        }
+
+        ret
+    }
+
+    pub fn is_quad_res(&self) -> bool {
+        self.sqrt().is_some().into()
+    }
+
+    pub fn is_even(&self) -> bool {
+        !self.is_odd()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Fp, FpRepr};
+    use super::*;
 
-    use fff::{Field, PrimeField, PrimeFieldRepr};
+    use ff::{Field, PrimeField};
     use rand_core::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
     #[test]
-    fn test_modulus() {
+    fn test_fp_modulus() {
+        let mut p_minus_1 = Fp::char();
+        p_minus_1[0] -= 1;
+        let p_minus_one = Fp::from_repr(p_minus_1).unwrap();
         assert_eq!(
-            format!("{:?}", Fp::char()), "0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab"
-            );
+            format!("{:?}", p_minus_one),
+            "Fp(0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaaa)"
+        );
     }
 
     #[test]
-    fn test_neg_one() {
-        let mut o = Fp::one();
-        o.negate();
-
+    fn test_fp_neg_one() {
         assert_eq!(
+            -Fp::one(),
             Fp(blst::blst_fp {
                 l: [
                     0x43f5fffffffcaaae,
@@ -944,415 +805,30 @@ mod tests {
                     0x40ab3263eff0206,
                 ]
             }),
-            o
         );
     }
 
     #[test]
-    fn test_fp_repr_ordering() {
-        use core::cmp::Ordering;
-
-        fn assert_equality(a: FpRepr, b: FpRepr) {
-            assert_eq!(a, b);
-            assert!(a.cmp(&b) == Ordering::Equal);
-        }
-
-        fn assert_lt(a: FpRepr, b: FpRepr) {
-            assert!(a < b);
-            assert!(b > a);
-        }
-
-        assert_equality(
-            FpRepr::new([9999, 9999, 9999, 9999, 9999, 9999]),
-            FpRepr::new([9999, 9999, 9999, 9999, 9999, 9999]),
-        );
-        assert_equality(
-            FpRepr::new([9999, 9998, 9999, 9999, 9999, 9999]),
-            FpRepr::new([9999, 9998, 9999, 9999, 9999, 9999]),
-        );
-        assert_equality(
-            FpRepr::new([9999, 9999, 9999, 9997, 9999, 9999]),
-            FpRepr::new([9999, 9999, 9999, 9997, 9999, 9999]),
-        );
-        assert_lt(
-            FpRepr::new([9999, 9999, 9999, 9997, 9999, 9998]),
-            FpRepr::new([9999, 9999, 9999, 9997, 9999, 9999]),
-        );
-        assert_lt(
-            FpRepr::new([9999, 9999, 9999, 9997, 9998, 9999]),
-            FpRepr::new([9999, 9999, 9999, 9997, 9999, 9999]),
-        );
-        assert_lt(
-            FpRepr::new([9, 9999, 9999, 9997, 9998, 9999]),
-            FpRepr::new([9999, 9999, 9999, 9997, 9999, 9999]),
-        );
+    fn test_fp_from_u64() {
+        let a = Fp::from(100);
+        let mut expected_bytes = [0u8; 48];
+        expected_bytes[0] = 100;
+        assert_eq!(a.to_bytes_le(), expected_bytes);
     }
 
     #[test]
-    fn test_fp_repr_from() {
-        assert_eq!(FpRepr::from(100), FpRepr::new([100, 0, 0, 0, 0, 0]));
+    fn test_fp_is_odd() {
+        assert!(Fp::from(0).is_even());
+        assert!(Fp::from(1).is_odd());
+        assert!(Fp::from(324834872).is_even());
+        assert!(Fp::from(324834873).is_odd());
     }
 
     #[test]
-    fn test_fp_repr_is_odd() {
-        assert!(!FpRepr::from(0).is_odd());
-        assert!(FpRepr::from(0).is_even());
-        assert!(FpRepr::from(1).is_odd());
-        assert!(!FpRepr::from(1).is_even());
-        assert!(!FpRepr::from(324834872).is_odd());
-        assert!(FpRepr::from(324834872).is_even());
-        assert!(FpRepr::from(324834873).is_odd());
-        assert!(!FpRepr::from(324834873).is_even());
-    }
-
-    #[test]
-    fn test_fp_repr_is_zero() {
-        assert!(FpRepr::from(0).is_zero());
-        assert!(!FpRepr::from(1).is_zero());
-        assert!(!FpRepr::new([0, 0, 0, 0, 1, 0]).is_zero());
-    }
-
-    #[test]
-    fn test_fp_repr_div2() {
-        let mut a = FpRepr::new([
-            0x8b0ad39f8dd7482a,
-            0x147221c9a7178b69,
-            0x54764cb08d8a6aa0,
-            0x8519d708e1d83041,
-            0x41f82777bd13fdb,
-            0xf43944578f9b771b,
-        ]);
-        a.div2();
-        assert_eq!(
-            a,
-            FpRepr::new([
-                0xc58569cfc6eba415,
-                0xa3910e4d38bc5b4,
-                0xaa3b265846c53550,
-                0xc28ceb8470ec1820,
-                0x820fc13bbde89fed,
-                0x7a1ca22bc7cdbb8d
-            ])
-        );
-        for _ in 0..10 {
-            a.div2();
-        }
-        assert_eq!(
-            a,
-            FpRepr::new([
-                0x6d31615a73f1bae9,
-                0x54028e443934e2f1,
-                0x82a8ec99611b14d,
-                0xfb70a33ae11c3b06,
-                0xe36083f04eef7a27,
-                0x1e87288af1f36e
-            ])
-        );
-        for _ in 0..300 {
-            a.div2();
-        }
-        assert_eq!(
-            a,
-            FpRepr::new([0x7288af1f36ee3608, 0x1e8, 0x0, 0x0, 0x0, 0x0])
-        );
-        for _ in 0..50 {
-            a.div2();
-        }
-        assert_eq!(a, FpRepr::new([0x7a1ca2, 0x0, 0x0, 0x0, 0x0, 0x0]));
-        for _ in 0..22 {
-            a.div2();
-        }
-        assert_eq!(a, FpRepr::new([0x1, 0x0, 0x0, 0x0, 0x0, 0x0]));
-        a.div2();
-        assert!(a.is_zero());
-    }
-
-    #[test]
-    fn test_fp_repr_shr() {
-        let mut a = FpRepr::new([
-            0xaa5cdd6172847ffd,
-            0x43242c06aed55287,
-            0x9ddd5b312f3dd104,
-            0xc5541fd48046b7e7,
-            0x16080cf4071e0b05,
-            0x1225f2901aea514e,
-        ]);
-        a.shr(0);
-        assert_eq!(
-            a,
-            FpRepr::new([
-                0xaa5cdd6172847ffd,
-                0x43242c06aed55287,
-                0x9ddd5b312f3dd104,
-                0xc5541fd48046b7e7,
-                0x16080cf4071e0b05,
-                0x1225f2901aea514e
-            ])
-        );
-        a.shr(1);
-        assert_eq!(
-            a,
-            FpRepr::new([
-                0xd52e6eb0b9423ffe,
-                0x21921603576aa943,
-                0xceeead98979ee882,
-                0xe2aa0fea40235bf3,
-                0xb04067a038f0582,
-                0x912f9480d7528a7
-            ])
-        );
-        a.shr(50);
-        assert_eq!(
-            a,
-            FpRepr::new([
-                0x8580d5daaa50f54b,
-                0xab6625e7ba208864,
-                0x83fa9008d6fcf3bb,
-                0x19e80e3c160b8aa,
-                0xbe52035d4a29c2c1,
-                0x244
-            ])
-        );
-        a.shr(130);
-        assert_eq!(
-            a,
-            FpRepr::new([
-                0xa0fea40235bf3cee,
-                0x4067a038f0582e2a,
-                0x2f9480d7528a70b0,
-                0x91,
-                0x0,
-                0x0
-            ])
-        );
-        a.shr(64);
-        assert_eq!(
-            a,
-            FpRepr::new([0x4067a038f0582e2a, 0x2f9480d7528a70b0, 0x91, 0x0, 0x0, 0x0])
-        );
-    }
-
-    #[test]
-    fn test_fp_repr_mul2() {
-        let mut a = FpRepr::from(23712937547);
-        a.mul2();
-        assert_eq!(a, FpRepr::new([0xb0acd6c96, 0x0, 0x0, 0x0, 0x0, 0x0]));
-        for _ in 0..60 {
-            a.mul2();
-        }
-        assert_eq!(
-            a,
-            FpRepr::new([0x6000000000000000, 0xb0acd6c9, 0x0, 0x0, 0x0, 0x0])
-        );
-        for _ in 0..300 {
-            a.mul2();
-        }
-        assert_eq!(
-            a,
-            FpRepr::new([0x0, 0x0, 0x0, 0x0, 0x0, 0xcd6c960000000000])
-        );
-        for _ in 0..17 {
-            a.mul2();
-        }
-        assert_eq!(
-            a,
-            FpRepr::new([0x0, 0x0, 0x0, 0x0, 0x0, 0x2c00000000000000])
-        );
-        for _ in 0..6 {
-            a.mul2();
-        }
-        assert!(a.is_zero());
-    }
-
-    #[test]
-    fn test_fp_repr_num_bits() {
-        let mut a = FpRepr::from(0);
-        assert_eq!(0, a.num_bits());
-        a = FpRepr::from(1);
-        for i in 1..385 {
-            assert_eq!(i, a.num_bits());
-            a.mul2();
-        }
-        assert_eq!(0, a.num_bits());
-    }
-
-    #[test]
-    fn test_fp_repr_sub_noborrow() {
-        let mut rng = XorShiftRng::from_seed([
-            0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
-            0xbc, 0xe5,
-        ]);
-
-        let mut t = FpRepr::new([
-            0x827a4a08041ebd9,
-            0x3c239f3dcc8f0d6b,
-            0x9ab46a912d555364,
-            0x196936b17b43910b,
-            0xad0eb3948a5c34fd,
-            0xd56f7b5ab8b5ce8,
-        ]);
-        t.sub_noborrow(&FpRepr::new([
-            0xc7867917187ca02b,
-            0x5d75679d4911ffef,
-            0x8c5b3e48b1a71c15,
-            0x6a427ae846fd66aa,
-            0x7a37e7265ee1eaf9,
-            0x7c0577a26f59d5,
-        ]));
-        assert!(
-            t == FpRepr::new([
-                0x40a12b8967c54bae,
-                0xdeae37a0837d0d7b,
-                0xe592c487bae374e,
-                0xaf26bbc934462a61,
-                0x32d6cc6e2b7a4a03,
-                0xcdaf23e091c0313
-            ])
-        );
-
-        for _ in 0..1000 {
-            let mut a = Fp::random(&mut rng).into_repr();
-            a.0[5] >>= 30;
-            let mut b = a;
-            for _ in 0..10 {
-                b.mul2();
-            }
-            let mut c = b;
-            for _ in 0..10 {
-                c.mul2();
-            }
-
-            assert!(a < b);
-            assert!(b < c);
-
-            let mut csub_ba = c;
-            csub_ba.sub_noborrow(&b);
-            csub_ba.sub_noborrow(&a);
-
-            let mut csub_ab = c;
-            csub_ab.sub_noborrow(&a);
-            csub_ab.sub_noborrow(&b);
-
-            assert_eq!(csub_ab, csub_ba);
-        }
-
-        // Subtracting q+1 from q should produce -1 (mod 2**384)
-        let mut qplusone = FpRepr::new([
-            0xb9feffffffffaaab,
-            0x1eabfffeb153ffff,
-            0x6730d2a0f6b0f624,
-            0x64774b84f38512bf,
-            0x4b1ba7b6434bacd7,
-            0x1a0111ea397fe69a,
-        ]);
-        qplusone.sub_noborrow(&FpRepr::new([
-            0xb9feffffffffaaac,
-            0x1eabfffeb153ffff,
-            0x6730d2a0f6b0f624,
-            0x64774b84f38512bf,
-            0x4b1ba7b6434bacd7,
-            0x1a0111ea397fe69a,
-        ]));
-        assert_eq!(
-            qplusone,
-            FpRepr::new([
-                0xffffffffffffffff,
-                0xffffffffffffffff,
-                0xffffffffffffffff,
-                0xffffffffffffffff,
-                0xffffffffffffffff,
-                0xffffffffffffffff
-            ])
-        );
-    }
-
-    #[test]
-    fn test_fp_repr_add_nocarry() {
-        let mut rng = XorShiftRng::from_seed([
-            0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
-            0xbc, 0xe5,
-        ]);
-
-        let mut t = FpRepr::new([
-            0x827a4a08041ebd9,
-            0x3c239f3dcc8f0d6b,
-            0x9ab46a912d555364,
-            0x196936b17b43910b,
-            0xad0eb3948a5c34fd,
-            0xd56f7b5ab8b5ce8,
-        ]);
-        t.add_nocarry(&FpRepr::new([
-            0xc7867917187ca02b,
-            0x5d75679d4911ffef,
-            0x8c5b3e48b1a71c15,
-            0x6a427ae846fd66aa,
-            0x7a37e7265ee1eaf9,
-            0x7c0577a26f59d5,
-        ]));
-        assert!(
-            t == FpRepr::new([
-                0xcfae1db798be8c04,
-                0x999906db15a10d5a,
-                0x270fa8d9defc6f79,
-                0x83abb199c240f7b6,
-                0x27469abae93e1ff6,
-                0xdd2fd2d4dfab6be
-            ])
-        );
-
-        // Test for the associativity of addition.
-        for _ in 0..1000 {
-            let mut a = Fp::random(&mut rng).into_repr();
-            let mut b = Fp::random(&mut rng).into_repr();
-            let mut c = Fp::random(&mut rng).into_repr();
-
-            // Unset the first few bits, so that overflow won't occur.
-            a.0[5] >>= 3;
-            b.0[5] >>= 3;
-            c.0[5] >>= 3;
-
-            let mut abc = a;
-            abc.add_nocarry(&b);
-            abc.add_nocarry(&c);
-
-            let mut acb = a;
-            acb.add_nocarry(&c);
-            acb.add_nocarry(&b);
-
-            let mut bac = b;
-            bac.add_nocarry(&a);
-            bac.add_nocarry(&c);
-
-            let mut bca = b;
-            bca.add_nocarry(&c);
-            bca.add_nocarry(&a);
-
-            let mut cab = c;
-            cab.add_nocarry(&a);
-            cab.add_nocarry(&b);
-
-            let mut cba = c;
-            cba.add_nocarry(&b);
-            cba.add_nocarry(&a);
-
-            assert_eq!(abc, acb);
-            assert_eq!(abc, bac);
-            assert_eq!(abc, bca);
-            assert_eq!(abc, cab);
-            assert_eq!(abc, cba);
-        }
-
-        // Adding 1 to (2^384 - 1) should produce zero
-        let mut x = FpRepr::new([
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-        ]);
-        x.add_nocarry(&FpRepr::from(1));
-        assert!(x.is_zero());
+    fn test_fp_is_zero() {
+        assert!(Fp::from(0).is_zero());
+        assert!(!Fp::from(1).is_zero());
+        assert!(!Fp::from_u64s_le(&[0, 0, 0, 0, 1, 0]).unwrap().is_zero());
     }
 
     #[test]
@@ -1440,7 +916,7 @@ mod tests {
             tmp.add_assign(&Fp(blst::blst_fp {
                 l: [1, 0, 0, 0, 0, 0],
             }));
-            assert!(tmp.into_repr().is_zero());
+            assert!(tmp.is_zero());
             // Add a random number to another one such that the result is q - 1
             tmp = Fp(blst::blst_fp {
                 l: [
@@ -1479,7 +955,7 @@ mod tests {
             tmp.add_assign(&Fp(blst::blst_fp {
                 l: [1, 0, 0, 0, 0, 0],
             }));
-            assert!(tmp.into_repr().is_zero());
+            assert!(tmp.is_zero());
         }
 
         // Test associativity
@@ -1716,7 +1192,7 @@ mod tests {
 
     #[test]
     fn test_fp_squaring() {
-        let mut a = Fp(blst::blst_fp {
+        let a = Fp(blst::blst_fp {
             l: [
                 0xffffffffffffffff,
                 0xffffffffffffffff,
@@ -1727,17 +1203,16 @@ mod tests {
             ],
         });
         assert!(!a.is_zero());
-        a.square();
         assert_eq!(
-            a,
-            Fp::from_repr(FpRepr::new([
+            a.square(),
+            Fp::from_u64s_le(&[
                 0x1cfb28fe7dfbbb86,
                 0x24cbe1731577a59,
                 0xcce1d4edc120e66e,
                 0xdc05c659b4e15b27,
                 0x79361e5a802c6a23,
                 0x24bcbe5d51b9a6f
-            ]))
+            ])
             .unwrap()
         );
 
@@ -1750,8 +1225,7 @@ mod tests {
             // Ensure that (a * a) = a^2
             let a = Fp::random(&mut rng);
 
-            let mut tmp = a;
-            tmp.square();
+            let tmp = a.square();
 
             let mut tmp2 = a;
             tmp2.mul_assign(&a);
@@ -1762,7 +1236,7 @@ mod tests {
 
     #[test]
     fn test_fp_inverse() {
-        assert!(Fp::zero().inverse().is_none());
+        assert_eq!(Fp::zero().invert().is_none().unwrap_u8(), 1);
 
         let mut rng = XorShiftRng::from_seed([
             0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
@@ -1774,7 +1248,7 @@ mod tests {
         for _ in 0..1000 {
             // Ensure that a * a^-1 = 1
             let mut a = Fp::random(&mut rng);
-            let ainv = a.inverse().unwrap();
+            let ainv = a.invert().unwrap();
             a.mul_assign(&ainv);
             assert_eq!(a, one);
         }
@@ -1789,21 +1263,16 @@ mod tests {
 
         for _ in 0..1000 {
             // Ensure doubling a is equivalent to adding a to itself.
-            let mut a = Fp::random(&mut rng);
-            let mut b = a;
-            b.add_assign(&a);
-            a.double();
-            assert_eq!(a, b);
+            let a = Fp::random(&mut rng);
+            assert_eq!(a.double(), a + a);
         }
     }
 
     #[test]
     fn test_fp_negate() {
         {
-            let mut a = Fp::zero();
-            a.negate();
-
-            assert!(a.is_zero());
+            let a = Fp::zero();
+            assert!((-a).is_zero());
         }
 
         let mut rng = XorShiftRng::from_seed([
@@ -1814,8 +1283,7 @@ mod tests {
         for _ in 0..1000 {
             // Ensure (a - (-a)) = 0.
             let mut a = Fp::random(&mut rng);
-            let mut b = a;
-            b.negate();
+            let b = -a;
             a.add_assign(&b);
 
             assert!(a.is_zero());
@@ -1833,7 +1301,7 @@ mod tests {
             // Exponentiate by various small numbers and ensure it consists with repeated
             // multiplication.
             let a = Fp::random(&mut rng);
-            let target = a.pow(&[i]);
+            let target = a.pow_vartime(&[i]);
             let mut c = Fp::one();
             for _ in 0..i {
                 c.mul_assign(&a);
@@ -1845,42 +1313,33 @@ mod tests {
             // Exponentiating by the modulus should have no effect in a prime field.
             let a = Fp::random(&mut rng);
 
-            assert_eq!(a, a.pow(Fp::char()));
+            assert_eq!(a, a.pow_vartime(MODULUS));
         }
     }
 
     #[test]
     fn test_fp_sqrt() {
-        use fff::SqrtField;
-
         let mut rng = XorShiftRng::from_seed([
             0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
             0xbc, 0xe5,
         ]);
 
         assert_eq!(Fp::zero().sqrt().unwrap(), Fp::zero());
+        assert_eq!(Fp::one().sqrt().unwrap(), Fp::one());
 
         for _ in 0..1000 {
             // Ensure sqrt(a^2) = a or -a
             let a = Fp::random(&mut rng);
-            let mut nega = a;
-            nega.negate();
-            let mut b = a;
-            b.square();
-
-            let b = b.sqrt().unwrap();
-
-            assert!(a == b || nega == b);
+            let a_new = a.square().sqrt().unwrap();
+            assert!(a_new == a || a_new == -a);
         }
 
         for _ in 0..1000 {
             // Ensure sqrt(a)^2 = a for random a
             let a = Fp::random(&mut rng);
-
-            if let Some(mut tmp) = a.sqrt() {
-                tmp.square();
-
-                assert_eq!(a, tmp);
+            let sqrt = a.sqrt();
+            if sqrt.is_some().into() {
+                assert_eq!(sqrt.unwrap().square(), a);
             }
         }
     }
@@ -1888,51 +1347,52 @@ mod tests {
     #[test]
     fn test_fp_from_into_repr() {
         // q + 1 should not be in the field
-        assert!(Fp::from_repr(FpRepr::new([
+        assert!(Fp::from_u64s_le(&[
             0xb9feffffffffaaac,
             0x1eabfffeb153ffff,
             0x6730d2a0f6b0f624,
             0x64774b84f38512bf,
             0x4b1ba7b6434bacd7,
             0x1a0111ea397fe69a
-        ]))
-        .is_err());
+        ])
+        .is_none());
 
         // q should not be in the field
-        assert!(Fp::from_repr(Fp::char()).is_err());
+        assert!(Fp::from_repr(Fp::char()).is_none());
 
         // Multiply some arbitrary representations to see if the result is as expected.
-        let a = FpRepr::new([
+        let mut a = Fp::from_u64s_le(&[
             0x4a49dad4ff6cde2d,
             0xac62a82a8f51cd50,
             0x2b1f41ab9f36d640,
             0x908a387f480735f1,
             0xae30740c08a875d7,
             0x6c80918a365ef78,
-        ]);
-        let mut a_fp = Fp::from_repr(a).unwrap();
-        let b = FpRepr::new([
+        ])
+        .unwrap();
+        let b = Fp::from_u64s_le(&[
             0xbba57917c32f0cf0,
             0xe7f878cf87f05e5d,
             0x9498b4292fd27459,
             0xd59fd94ee4572cfa,
             0x1f607186d5bb0059,
             0xb13955f5ac7f6a3,
-        ]);
-        let b_fp = Fp::from_repr(b).unwrap();
-        let c = FpRepr::new([
+        ])
+        .unwrap();
+        let c = Fp::from_u64s_le(&[
             0xf5f70713b717914c,
             0x355ea5ac64cbbab1,
             0xce60dd43417ec960,
             0xf16b9d77b0ad7d10,
             0xa44c204c1de7cdb7,
             0x1684487772bc9a5a,
-        ]);
-        a_fp.mul_assign(&b_fp);
-        assert_eq!(a_fp.into_repr(), c);
+        ])
+        .unwrap();
+        a.mul_assign(&b);
+        assert_eq!(a, c);
 
         // Zero should be in the field.
-        assert!(Fp::from_repr(FpRepr::from(0)).unwrap().is_zero());
+        assert!(Fp::from(0).is_zero());
 
         let mut rng = XorShiftRng::from_seed([
             0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
@@ -1942,39 +1402,18 @@ mod tests {
         for _ in 0..1000 {
             // Try to turn Fp elements into representations and back again, and compare.
             let a = Fp::random(&mut rng);
-            let a_repr = a.into_repr();
-            let b_repr = FpRepr::from(a);
+            let a_repr = a.to_repr();
+            let b = Fp::from_repr(a_repr).unwrap();
+            let b_repr = b.to_repr();
+            assert_eq!(a, b);
             assert_eq!(a_repr, b_repr);
-            let a_again = Fp::from_repr(a_repr).unwrap();
-
-            assert_eq!(a, a_again);
         }
-    }
-
-    #[test]
-    fn test_fp_repr_display() {
-        assert_eq!(
-        format!("{}", FpRepr::new([0xa956babf9301ea24, 0x39a8f184f3535c7b, 0xb38d35b3f6779585, 0x676cc4eef4c46f2c, 0xb1d4aad87651e694, 0x1947f0d5f4fe325a])),
-        "0x1947f0d5f4fe325ab1d4aad87651e694676cc4eef4c46f2cb38d35b3f677958539a8f184f3535c7ba956babf9301ea24".to_string()
-    );
-        assert_eq!(
-        format!("{}", FpRepr::new([0xb4171485fd8622dd, 0x864229a6edec7ec5, 0xc57f7bdcf8dfb707, 0x6db7ff0ecea4584a, 0xf8d8578c4a57132d, 0x6eb66d42d9fcaaa])),
-        "0x06eb66d42d9fcaaaf8d8578c4a57132d6db7ff0ecea4584ac57f7bdcf8dfb707864229a6edec7ec5b4171485fd8622dd".to_string()
-    );
-        assert_eq!(
-        format!("{}", FpRepr::new([0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff])),
-        "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()
-    );
-        assert_eq!(
-        format!("{}", FpRepr::new([0, 0, 0, 0, 0, 0])),
-        "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string()
-    );
     }
 
     #[test]
     fn test_fp_display() {
         assert_eq!(
-            format!("{}", Fp::from_repr(FpRepr::new([
+            format!("{}", Fp::from_u64s_le(&[
                 0xa956babf9301ea24,
                 0x39a8f184f3535c7b,
                 0xb38d35b3f6779585,
@@ -1982,32 +1421,45 @@ mod tests {
                 0xb1d4aad87651e694,
                 0x1947f0d5f4fe325a
             ])
-            ).unwrap()),
+            .unwrap()),
             "Fp(0x1947f0d5f4fe325ab1d4aad87651e694676cc4eef4c46f2cb38d35b3f677958539a8f184f3535c7ba956babf9301ea24)".to_string()
-    );
+        );
+
         assert_eq!(
-        format!("{}", Fp::from_repr(FpRepr::new([0xe28e79396ac2bbf8, 0x413f6f7f06ea87eb, 0xa4b62af4a792a689, 0xb7f89f88f59c1dc5, 0x9a551859b1e43a9a, 0x6c9f5a1060de974])).unwrap()),
-        "Fp(0x06c9f5a1060de9749a551859b1e43a9ab7f89f88f59c1dc5a4b62af4a792a689413f6f7f06ea87ebe28e79396ac2bbf8)".to_string()
-    );
+            format!("{}", Fp::from_u64s_le(&[
+               0xe28e79396ac2bbf8,
+               0x413f6f7f06ea87eb,
+               0xa4b62af4a792a689,
+               0xb7f89f88f59c1dc5,
+               0x9a551859b1e43a9a,
+               0x6c9f5a1060de974
+            ])
+            .unwrap()),
+            "Fp(0x06c9f5a1060de9749a551859b1e43a9ab7f89f88f59c1dc5a4b62af4a792a689413f6f7f06ea87ebe28e79396ac2bbf8)".to_string()
+        );
     }
 
     #[test]
     fn test_fp_num_bits() {
         assert_eq!(Fp::NUM_BITS, 381);
         assert_eq!(Fp::CAPACITY, 380);
+
+        let mut a = Fp::from(0);
+        assert_eq!(0, a.num_bits());
+        a = Fp::from(1);
+        assert_eq!(1, a.num_bits());
+        for i in 2..Fp::NUM_BITS {
+            a = a.shl(1);
+            assert_eq!(i, a.num_bits());
+        }
     }
 
     #[test]
     fn test_fp_root_of_unity() {
-        use fff::SqrtField;
-
         assert_eq!(Fp::S, 1);
+        assert_eq!(Fp::multiplicative_generator(), Fp::from(2));
         assert_eq!(
-            Fp::multiplicative_generator(),
-            Fp::from_repr(FpRepr::from(2)).unwrap()
-        );
-        assert_eq!(
-            Fp::multiplicative_generator().pow(&[
+            Fp::multiplicative_generator().pow_vartime(&[
                 0xdcff7fffffffd555,
                 0xf55ffff58a9ffff,
                 0xb39869507b587b12,
@@ -2017,19 +1469,52 @@ mod tests {
             ]),
             Fp::root_of_unity()
         );
-        assert_eq!(
-            Fp::root_of_unity().pow(&[1 << Fp::S, 0, 0, 0, 0, 0]),
-            Fp::one()
-        );
-        assert!(Fp::multiplicative_generator().sqrt().is_none());
+        assert_eq!(Fp::root_of_unity().pow_vartime(&[1 << Fp::S]), Fp::one());
+        assert!(!Fp::multiplicative_generator().is_quad_res());
     }
 
     #[test]
     fn fp_field_tests() {
         crate::tests::field::random_field_tests::<Fp>();
         crate::tests::field::random_sqrt_tests::<Fp>();
-        crate::tests::field::random_frobenius_tests::<Fp, _>(Fp::char(), 13);
-        crate::tests::field::from_str_tests::<Fp>();
+    }
+
+    #[test]
+    fn test_fp_from_str() {
+        {
+            let a = "84395729384759238745923745892374598234705297301958723458712394587103249587213984572934750213947582345792304758273458972349582734958273495872304598234";
+            let b = "38495729084572938457298347502349857029384609283450692834058293405982304598230458230495820394850293845098234059823049582309485203948502938452093482039";
+            let c = "3248875134290623212325429203829831876024364170316860259933542844758450336418538569901990710701240661702808867062612075657861768196242274635305077449545396068598317421057721935408562373834079015873933065667961469731886739181625866970316226171512545167081793907058686908697431878454091011239990119126";
+
+            let mut a = Fp::from_str(a).unwrap();
+            let b = Fp::from_str(b).unwrap();
+            let c = Fp::from_str(c).unwrap();
+
+            a.mul_assign(&b);
+
+            assert_eq!(a, c);
+        }
+
+        {
+            let mut rng = XorShiftRng::from_seed([
+                0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+                0xbc, 0xe5,
+            ]);
+
+            for _ in 0..1000 {
+                let n = rng.next_u64();
+
+                let a = Fp::from_str(&format!("{}", n)).unwrap();
+                let b = Fp::from(n);
+
+                assert_eq!(a, b);
+            }
+        }
+
+        assert!(Fp::from_str("").is_none());
+        assert!(Fp::from_str("0").unwrap().is_zero());
+        assert!(Fp::from_str("00").is_none());
+        assert!(Fp::from_str("00000000000").is_none());
     }
 
     #[test]
@@ -2037,34 +1522,26 @@ mod tests {
         // FpRepr's ordering is well-tested, but we still need to make sure the Fp
         // elements aren't being compared in Montgomery form.
         for i in 0..100 {
-            let a = FpRepr::from(i + 1);
-            let b = FpRepr::from(i);
-            assert!(
-                Fp::from_repr(a).unwrap() > Fp::from_repr(b).unwrap(),
-                "{}: {:?} > {:?}",
-                i,
-                a,
-                b
-            );
+            let a = Fp::from(i + 1);
+            let b = Fp::from(i);
+            assert!(a > b, "{}: {:?} > {:?}", i, a, b);
         }
-    }
-
-    #[test]
-    fn fp_repr_tests() {
-        crate::tests::repr::random_repr_tests::<Fp>();
     }
 
     #[test]
     fn test_fp_repr_conversion() {
         let a = Fp::from(1);
-        let b = Fp::from_repr(FpRepr::from(1)).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(Fp::from(1).into_repr(), FpRepr::from(1));
+        let mut expected_bytes = [0u8; 48];
+        expected_bytes[0] = 1;
+        assert_eq!(a, Fp::from_repr(a.to_repr()).unwrap());
+        assert_eq!(a.to_repr(), expected_bytes);
+        assert_eq!(a, Fp::from_repr(expected_bytes).unwrap());
 
         let a = Fp::from(12);
-        assert_eq!(a, Fp::from_repr(a.into_repr()).unwrap());
-
-        let a = FpRepr::from(12);
-        assert_eq!(Fp::from_repr(a).unwrap().into_repr(), a);
+        let mut expected_bytes = [0u8; 48];
+        expected_bytes[0] = 12;
+        assert_eq!(a, Fp::from_repr(a.to_repr()).unwrap());
+        assert_eq!(a.to_repr(), expected_bytes);
+        assert_eq!(a, Fp::from_repr(expected_bytes).unwrap());
     }
 }

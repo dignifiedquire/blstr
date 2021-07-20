@@ -3,275 +3,156 @@
 
 use core::{
     cmp,
-    convert::TryInto,
+    convert::TryFrom,
     fmt, mem,
     ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 
 use blst::*;
-use fff::{Field, PrimeField};
+use ff::{Field, PrimeField};
+use rand_core::RngCore;
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 /// Represents an element of the scalar field $\mathbb{F}_q$ of the BLS12-381 elliptic
 /// curve construction.
 ///
-/// The inner representation is stored in Montgomery form.
+/// The inner representation `blst_fr` is stored in Montgomery form as little-endian `u64` limbs.
 #[derive(Default, Clone, Copy)]
 pub struct Scalar(pub(crate) blst_fr);
 
-/// Representation of a `Scalar`, in regular coordinates.
-#[derive(Default, Clone, Copy)]
-pub struct ScalarRepr(pub [u64; 4]);
+// Little-endian non-Montgomery form not reduced mod p.
+#[allow(dead_code)]
+const MODULUS: [u64; 4] = [
+    0xffff_ffff_0000_0001,
+    0x53bd_a402_fffe_5bfe,
+    0x3339_d808_09a1_d805,
+    0x73ed_a753_299d_7d48,
+];
 
-impl AsRef<[u64]> for ScalarRepr {
-    fn as_ref(&self) -> &[u64] {
-        &self.0
-    }
-}
+// Little-endian non-Montgomery form not reduced mod p.
+const MODULUS_REPR: [u8; 32] = [
+    0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x5b, 0xfe, 0xff, 0x02, 0xa4, 0xbd, 0x53,
+    0x05, 0xd8, 0xa1, 0x09, 0x08, 0xd8, 0x39, 0x33, 0x48, 0x7d, 0x9d, 0x29, 0x53, 0xa7, 0xed, 0x73,
+];
 
-impl AsMut<[u64]> for ScalarRepr {
-    fn as_mut(&mut self) -> &mut [u64] {
-        &mut self.0
-    }
-}
+// `2^S` root of unity in little-endian Montgomery form.
+const ROOT_OF_UNITY: Scalar = Scalar(blst_fr {
+    l: [
+        0xb9b5_8d8c_5f0e_466a,
+        0x5b1b_4c80_1819_d7ec,
+        0x0af5_3ae3_52a3_1e64,
+        0x5bf3_adda_19e9_b27b,
+    ],
+});
 
-impl AsRef<blst_fr> for Scalar {
-    fn as_ref(&self) -> &blst_fr {
-        &self.0
-    }
-}
+/// `R = 2^256 mod q` in little-endian Montgomery form which is equivalent to 1 in little-endian
+/// non-Montgomery form.
+///
+/// sage> mod(2^256, 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001)
+/// sage> 0x1824b159acc5056f998c4fefecbc4ff55884b7fa0003480200000001fffffffe
+const R: Scalar = Scalar(blst_fr {
+    l: [
+        0x0000_0001_ffff_fffe,
+        0x5884_b7fa_0003_4802,
+        0x998c_4fef_ecbc_4ff5,
+        0x1824_b159_acc5_056f,
+    ],
+});
 
-impl AsMut<blst_fr> for Scalar {
-    fn as_mut(&mut self) -> &mut blst_fr {
-        &mut self.0
-    }
-}
+/// `R^2 = 2^512 mod q` in little-endian Montgomery form.
+///
+/// sage> mod(2^512, 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001)
+/// sage> 0x748d9d99f59ff1105d314967254398f2b6cedcb87925c23c999e990f3f29c6d
+const R2: Scalar = Scalar(blst_fr {
+    l: [
+        0xc999_e990_f3f2_9c6d,
+        0x2b6c_edcb_8792_5c23,
+        0x05d3_1496_7254_398f,
+        0x0748_d9d9_9f59_ff11,
+    ],
+});
 
-#[allow(clippy::from_over_into)]
-impl Into<blst_scalar> for Scalar {
-    fn into(self) -> blst_scalar {
-        let mut out = blst_scalar::default();
-        unsafe {
-            blst_scalar_from_fr(&mut out, &self.0);
-        }
-
-        out
-    }
-}
-
-const LIMBS: usize = 4;
-const LIMB_BITS: usize = 64;
-
-const MODULUS: ScalarRepr = ScalarRepr([
-    0xffffffff00000001,
-    0x53bda402fffe5bfe,
-    0x3339d80809a1d805,
-    0x73eda753299d7d48,
-]);
-
-/// R = 2^256 mod q
-const R: ScalarRepr = ScalarRepr([1, 0, 0, 0]);
-
-impl fmt::Debug for ScalarRepr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "0x")?;
-        for &b in self.0.iter().rev() {
-            write!(f, "{:016x}", b)?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for ScalarRepr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "0x")?;
-        for &b in self.0.iter().rev() {
-            write!(f, "{:016x}", b)?;
-        }
-        Ok(())
-    }
-}
-
-impl From<u64> for ScalarRepr {
-    fn from(val: u64) -> ScalarRepr {
-        ScalarRepr([val, 0, 0, 0])
-    }
-}
-
-impl Ord for ScalarRepr {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        for (a, b) in self.0.iter().rev().zip(other.0.iter().rev()) {
-            match a.cmp(b) {
-                cmp::Ordering::Greater => {
-                    return cmp::Ordering::Greater;
-                }
-                cmp::Ordering::Less => {
-                    return cmp::Ordering::Less;
-                }
-                cmp::Ordering::Equal => {}
-            }
-        }
-
-        cmp::Ordering::Equal
-    }
-}
-
-impl PartialOrd for ScalarRepr {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for ScalarRepr {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl Eq for ScalarRepr {}
-
-impl fff::PrimeFieldRepr for ScalarRepr {
-    fn sub_noborrow(&mut self, other: &Self) {
-        let mut borrow = 0;
-
-        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
-            *a = fff::sbb(*a, *b, &mut borrow);
-        }
-    }
-
-    fn add_nocarry(&mut self, other: &Self) {
-        let mut carry = 0;
-
-        for (a, b) in self.0.iter_mut().zip(other.0.iter()) {
-            *a = fff::adc(*a, *b, &mut carry);
-        }
-    }
-
-    fn num_bits(&self) -> u32 {
-        let mut ret = (LIMBS as u32) * LIMB_BITS as u32;
-        for i in self.0.iter().rev() {
-            let leading = i.leading_zeros();
-            ret -= leading;
-            if leading != LIMB_BITS as u32 {
-                break;
-            }
-        }
-
-        ret
-    }
-
-    fn is_zero(&self) -> bool {
-        self.0.iter().all(|&e| e == 0)
-    }
-
-    fn is_odd(&self) -> bool {
-        self.0[0] & 1 == 1
-    }
-
-    fn is_even(&self) -> bool {
-        !self.is_odd()
-    }
-
-    fn div2(&mut self) {
-        let mut t = 0;
-        for i in self.0.iter_mut().rev() {
-            let t2 = *i << 63;
-            *i >>= 1;
-            *i |= t;
-            t = t2;
-        }
-    }
-
-    fn shr(&mut self, mut n: u32) {
-        if n as usize >= LIMB_BITS * LIMBS {
-            *self = Self::from(0);
-            return;
-        }
-
-        while n >= LIMB_BITS as u32 {
-            let mut t = 0;
-            for i in self.0.iter_mut().rev() {
-                mem::swap(&mut t, i);
-            }
-            n -= LIMB_BITS as u32;
-        }
-
-        if n > 0 {
-            let mut t = 0;
-            for i in self.0.iter_mut().rev() {
-                let t2 = *i << (LIMB_BITS as u32 - n);
-                *i >>= n;
-                *i |= t;
-                t = t2;
-            }
-        }
-    }
-
-    fn mul2(&mut self) {
-        let mut last = 0;
-        for i in &mut self.0 {
-            let tmp = *i >> 63;
-            *i <<= 1;
-            *i |= last;
-            last = tmp;
-        }
-    }
-
-    fn shl(&mut self, mut n: u32) {
-        if n as usize >= LIMB_BITS * LIMBS {
-            *self = Self::from(0);
-            return;
-        }
-
-        while n >= LIMB_BITS as u32 {
-            let mut t = 0;
-            for i in &mut self.0 {
-                mem::swap(&mut t, i);
-            }
-            n -= LIMB_BITS as u32;
-        }
-
-        if n > 0 {
-            let mut t = 0;
-            for i in &mut self.0 {
-                let t2 = *i >> (LIMB_BITS as u32 - n);
-                *i <<= n;
-                *i |= t;
-                t = t2;
-            }
-        }
-    }
-}
+/// `R^3 = 2^768 mod q` in little-endian Montgomery form.
+///
+/// sage> mod(2^768, 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001)
+/// sage> 0x6e2a5bb9c8db33e973d13c71c7b5f4181b3e0d188cf06990c62c1807439b73af
+const R3: Scalar = Scalar(blst_fr {
+    l: [
+        0xc62c_1807_439b_73af,
+        0x1b3e_0d18_8cf0_6990,
+        0x73d1_3c71_c7b5_f418,
+        0x6e2a_5bb9_c8db_33e9,
+    ],
+});
 
 pub const S: u32 = 32;
 
 impl fmt::Debug for Scalar {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Scalar({:?})", self.into_repr())
+        let be_bytes = self.to_bytes_be();
+        write!(f, "Scalar(0x")?;
+        for &b in be_bytes.iter() {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, ")")?;
+        Ok(())
     }
 }
 
 impl fmt::Display for Scalar {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Scalar({})", self.into_repr())
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Ord for Scalar {
+    fn cmp(&self, other: &Scalar) -> cmp::Ordering {
+        for (a, b) in self.to_bytes_be().iter().zip(other.to_bytes_be().iter()) {
+            if a > b {
+                return cmp::Ordering::Greater;
+            } else if a < b {
+                return cmp::Ordering::Less;
+            }
+        }
+        cmp::Ordering::Equal
+    }
+}
+
+impl PartialOrd for Scalar {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Scalar) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
 impl PartialEq for Scalar {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.0.l[0] == other.0.l[0]
-            && self.0.l[1] == other.0.l[1]
-            && self.0.l[2] == other.0.l[2]
-            && self.0.l[3] == other.0.l[3]
+        self.0.l == other.0.l
     }
 }
+
 impl Eq for Scalar {}
 
-impl From<Scalar> for ScalarRepr {
-    fn from(val: Scalar) -> Self {
-        let mut out = [0u64; 4];
-        unsafe { blst_uint64_from_fr(out.as_mut_ptr(), &val.0) };
-        ScalarRepr(out)
+impl ConstantTimeEq for Scalar {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.l[0].ct_eq(&other.0.l[0])
+            & self.0.l[1].ct_eq(&other.0.l[1])
+            & self.0.l[2].ct_eq(&other.0.l[2])
+            & self.0.l[3].ct_eq(&other.0.l[3])
+    }
+}
+
+impl ConditionallySelectable for Scalar {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        Scalar(blst_fr {
+            l: [
+                u64::conditional_select(&a.0.l[0], &b.0.l[0], choice),
+                u64::conditional_select(&a.0.l[1], &b.0.l[1], choice),
+                u64::conditional_select(&a.0.l[2], &b.0.l[2], choice),
+                u64::conditional_select(&a.0.l[3], &b.0.l[3], choice),
+            ],
+        })
     }
 }
 
@@ -289,19 +170,20 @@ impl From<blst_fr> for Scalar {
 
 impl From<u64> for Scalar {
     fn from(val: u64) -> Scalar {
-        Scalar::from_repr(ScalarRepr::from(val)).expect("u64 is alaways in the field")
+        let mut repr = [0u8; 32];
+        repr[..8].copy_from_slice(&val.to_le_bytes());
+        Scalar::from_bytes_le(&repr).unwrap()
     }
 }
 
-impl<'a> Neg for &'a Scalar {
+impl Neg for &Scalar {
     type Output = Scalar;
 
     #[inline]
     fn neg(self) -> Scalar {
-        let mut out = *self;
-        out.negate();
-
-        out
+        let mut neg = blst_fr::default();
+        unsafe { blst_fr_cneg(&mut neg, &self.0, true) };
+        Scalar(neg)
     }
 }
 
@@ -314,268 +196,208 @@ impl Neg for Scalar {
     }
 }
 
-impl<'a, 'b> Sub<&'b Scalar> for &'a Scalar {
+impl Add<&Scalar> for &Scalar {
     type Output = Scalar;
 
     #[inline]
-    fn sub(self, rhs: &'b Scalar) -> Scalar {
-        self.sub(rhs)
+    fn add(self, rhs: &Scalar) -> Scalar {
+        let mut out = blst_fr::default();
+        unsafe { blst_fr_add(&mut out, &self.0, &rhs.0) };
+        Scalar(out)
     }
 }
 
-impl<'a, 'b> Add<&'b Scalar> for &'a Scalar {
+impl Sub<&Scalar> for &Scalar {
     type Output = Scalar;
 
     #[inline]
-    fn add(self, rhs: &'b Scalar) -> Scalar {
-        self.add(rhs)
+    fn sub(self, rhs: &Scalar) -> Scalar {
+        let mut out = blst_fr::default();
+        unsafe { blst_fr_sub(&mut out, &self.0, &rhs.0) };
+        Scalar(out)
     }
 }
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a Scalar {
+impl Mul<&Scalar> for &Scalar {
     type Output = Scalar;
 
     #[inline]
-    fn mul(self, rhs: &'b Scalar) -> Scalar {
-        self.mul(rhs)
+    fn mul(self, rhs: &Scalar) -> Scalar {
+        let mut out = blst_fr::default();
+        unsafe { blst_fr_mul(&mut out, &self.0, &rhs.0) };
+        Scalar(out)
     }
 }
 
-impl_binops_additive!(Scalar, Scalar, fff::Field);
-impl_binops_multiplicative!(Scalar, Scalar, fff::Field);
+impl AddAssign<&Scalar> for Scalar {
+    #[inline]
+    fn add_assign(&mut self, rhs: &Scalar) {
+        unsafe { blst_fr_add(&mut self.0, &self.0, &rhs.0) };
+    }
+}
+
+impl SubAssign<&Scalar> for Scalar {
+    #[inline]
+    fn sub_assign(&mut self, rhs: &Scalar) {
+        unsafe { blst_fr_sub(&mut self.0, &self.0, &rhs.0) };
+    }
+}
+
+impl MulAssign<&Scalar> for Scalar {
+    #[inline]
+    fn mul_assign(&mut self, rhs: &Scalar) {
+        unsafe { blst_fr_mul(&mut self.0, &self.0, &rhs.0) };
+    }
+}
+
+impl_add_sub!(Scalar);
+impl_add_sub_assign!(Scalar);
+impl_mul!(Scalar);
+impl_mul_assign!(Scalar);
 
 /// The number of bits we should "shave" from a randomly sampled reputation.
 const REPR_SHAVE_BITS: usize = 256 - Scalar::NUM_BITS as usize;
 
-impl fff::Field for Scalar {
-    fn random<R: rand_core::RngCore>(rng: &mut R) -> Self {
+impl Field for Scalar {
+    fn random(mut rng: impl RngCore) -> Self {
         loop {
-            let mut raw = blst_fr::default();
+            let mut raw = [0u64; 4];
             for i in 0..4 {
-                raw.l[i] = rng.next_u64();
+                raw[i] = rng.next_u64();
             }
 
             // Mask away the unused most-significant bits.
-            raw.l[3] &= 0xffffffffffffffff >> REPR_SHAVE_BITS;
+            raw[3] &= 0xffffffffffffffff >> REPR_SHAVE_BITS;
 
-            if ScalarRepr(raw.l) < MODULUS {
-                return Scalar(raw);
+            if let Some(scalar) = Scalar::from_u64s_le(&raw) {
+                return scalar;
             }
         }
     }
 
     fn zero() -> Self {
-        Scalar(blst_fr::default())
+        Scalar(blst_fr { l: [0, 0, 0, 0] })
     }
 
     fn one() -> Self {
-        Scalar::from_repr(R).unwrap()
+        R
     }
 
     fn is_zero(&self) -> bool {
-        self == &Self::zero()
+        self.0.l == [0, 0, 0, 0]
     }
 
-    fn square(&mut self) {
-        unsafe { blst_fr_sqr(&mut self.0, &self.0) }
+    fn square(&self) -> Self {
+        let mut sq = blst_fr::default();
+        unsafe { blst_fr_sqr(&mut sq, &self.0) }
+        Scalar(sq)
     }
 
-    fn double(&mut self) {
-        unsafe { blst_fr_add(&mut self.0, &self.0, &self.0) }
+    fn double(&self) -> Self {
+        self + self
     }
 
-    fn negate(&mut self) {
-        unsafe { blst_fr_cneg(&mut self.0, &self.0, true) };
+    fn invert(&self) -> CtOption<Self> {
+        let mut inv = blst_fr::default();
+        unsafe { blst_fr_eucl_inverse(&mut inv, &self.0) };
+        let is_invertible = !self.ct_eq(&Scalar::zero());
+        CtOption::new(Scalar(inv), is_invertible)
     }
 
-    fn add_assign(&mut self, other: &Self) {
-        unsafe { blst_fr_add(&mut self.0, &self.0, &other.0) };
-    }
+    /// Warning: this is not constant-time.
+    fn sqrt(&self) -> CtOption<Self> {
+        // Tonelli-Shank's algorithm for q mod 16 = 1
+        // https://eprint.iacr.org/2012/685.pdf (page 12, algorithm 5)
+        match self.legendre() {
+            0 => return CtOption::new(*self, Choice::from(1)),
+            -1 => return CtOption::new(Scalar::default(), Choice::from(0)),
+            _ => {}
+        };
 
-    fn sub_assign(&mut self, other: &Self) {
-        unsafe { blst_fr_sub(&mut self.0, &self.0, &other.0) };
-    }
+        let mut c = Self::root_of_unity();
+        let mut r = self.pow_vartime([
+            9223141137265459200,
+            347036667491570177,
+            10722717374829358084,
+            972477353,
+        ]);
+        let mut t = self.pow_vartime([
+            18446282274530918399,
+            694073334983140354,
+            2998690675949164552,
+            1944954707,
+        ]);
+        let mut m = S;
 
-    fn mul_assign(&mut self, other: &Self) {
-        unsafe { blst_fr_mul(&mut self.0, &self.0, &other.0) };
-    }
+        while t != Self::one() {
+            let mut i = 1;
+            {
+                let mut t2i = t;
+                t2i = t2i.square();
+                loop {
+                    if t2i == Self::one() {
+                        break;
+                    }
+                    t2i = t2i.square();
+                    i += 1;
+                }
+            }
 
-    fn inverse(&self) -> Option<Self> {
-        let mut t0 = blst_fr::default();
-        unsafe {
-            blst_fr_eucl_inverse(&mut t0, &self.0);
+            for _ in 0..(m - i - 1) {
+                c = c.square();
+            }
+            r *= &c;
+            c = c.square();
+            t *= &c;
+            m = i;
         }
-        if self.is_zero() {
-            None
-        } else {
-            Some(Scalar(t0))
-        }
-    }
 
-    fn frobenius_map(&mut self, _: usize) {
-        // This has no effect in a prime field.
+        CtOption::new(r, Choice::from(1))
     }
 }
 
-impl ScalarRepr {
-    pub const fn new(raw: [u64; 4]) -> Self {
-        ScalarRepr(raw)
-    }
-}
-
-impl fff::PrimeField for Scalar {
-    type Repr = ScalarRepr;
+impl PrimeField for Scalar {
+    // Little-endian non-Montgomery form bigint mod p.
+    type Repr = [u8; 32];
 
     const NUM_BITS: u32 = 255;
     const CAPACITY: u32 = Self::NUM_BITS - 1;
     const S: u32 = S;
 
-    fn from_repr(repr: Self::Repr) -> Result<Self, fff::PrimeFieldDecodingError> {
-        if ScalarRepr(repr.0) < MODULUS {
-            let mut out = blst_fr::default();
-            unsafe { blst_fr_from_uint64(&mut out, repr.0.as_ptr()) }
-            Ok(Scalar(out))
-        } else {
-            Err(fff::PrimeFieldDecodingError::NotInField(
-                "not in field".to_string(),
-            ))
-        }
+    /// Converts a little-endian non-Montgomery form `repr` into a Montgomery form `Scalar`.
+    fn from_repr(repr: Self::Repr) -> Option<Self> {
+        Self::from_bytes_le(&repr)
     }
 
-    /// Convert a biginteger representation into a prime field element, if
-    /// the number is an element of the field.
-    fn into_repr(&self) -> Self::Repr {
-        (*self).into()
+    /// Converts a Montgomery form `Scalar` into little-endian non-Montgomery from.
+    fn to_repr(&self) -> Self::Repr {
+        self.to_bytes_le()
     }
 
-    fn char() -> Self::Repr {
-        MODULUS
+    fn is_odd(&self) -> bool {
+        self.to_repr()[0] & 1 == 1
     }
 
     fn multiplicative_generator() -> Self {
-        Scalar::from_repr(ScalarRepr::new([7, 0, 0, 0])).unwrap()
+        Scalar::from(7)
     }
 
     fn root_of_unity() -> Self {
-        Scalar(blst_fr {
-            l: [
-                0xb9b58d8c5f0e466a,
-                0x5b1b4c801819d7ec,
-                0x0af53ae352a31e64,
-                0x5bf3adda19e9b27b,
-            ],
-        })
-    }
-
-    fn from_random_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut repr = ScalarRepr::default();
-
-        for (limb, chunk) in repr.0.iter_mut().zip(bytes.chunks_exact(8)) {
-            *limb = u64::from_le_bytes(chunk.try_into().unwrap());
-        }
-
-        // Mask away the unused most-significant bits.
-        repr.0[3] &= 0xffffffffffffffff >> REPR_SHAVE_BITS;
-
-        Scalar::from_repr(repr).ok()
+        ROOT_OF_UNITY
     }
 }
 
-impl fff::SqrtField for Scalar {
-    fn legendre(&self) -> fff::LegendreSymbol {
-        const MOD_MINUS_1_OVER_2: [u64; 4] = [
-            0x7fffffff80000000,
-            0xa9ded2017fff2dff,
-            0x199cec0404d0ec02,
-            0x39f6d3a994cebea4,
-        ];
-        // s = self^((modulus - 1) // 2)
-        let s = self.pow(MOD_MINUS_1_OVER_2);
-        if s == Self::zero() {
-            fff::LegendreSymbol::Zero
-        } else if s == Self::one() {
-            fff::LegendreSymbol::QuadraticResidue
-        } else {
-            fff::LegendreSymbol::QuadraticNonResidue
+// Returns `true` if  `le_bytes` is less than the modulus (both are in non-Montgomery form).
+fn is_valid(le_bytes: &[u8; 32]) -> bool {
+    for (a, b) in le_bytes.iter().zip(MODULUS_REPR.iter()).rev() {
+        if a > b {
+            return false;
+        } else if a < b {
+            return true;
         }
     }
-
-    fn sqrt(&self) -> Option<Self> {
-        // Tonelli-Shank's algorithm for q mod 16 = 1
-        // https://eprint.iacr.org/2012/685.pdf (page 12, algorithm 5)
-        match self.legendre() {
-            fff::LegendreSymbol::Zero => Some(*self),
-            fff::LegendreSymbol::QuadraticNonResidue => None,
-            fff::LegendreSymbol::QuadraticResidue => {
-                let mut c = Self::root_of_unity();
-                let mut r = self.pow([
-                    9223141137265459200,
-                    347036667491570177,
-                    10722717374829358084,
-                    972477353,
-                ]);
-                let mut t = self.pow([
-                    18446282274530918399,
-                    694073334983140354,
-                    2998690675949164552,
-                    1944954707,
-                ]);
-                let mut m = S;
-
-                while t != Self::one() {
-                    let mut i = 1;
-                    {
-                        let mut t2i = t;
-                        t2i.square();
-                        loop {
-                            if t2i == Self::one() {
-                                break;
-                            }
-                            t2i.square();
-                            i += 1;
-                        }
-                    }
-
-                    for _ in 0..(m - i - 1) {
-                        c.square();
-                    }
-                    r *= &c;
-                    c.square();
-                    t *= &c;
-                    m = i;
-                }
-
-                Some(r)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct NotInFieldError;
-
-impl fmt::Display for NotInFieldError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Not in field")
-    }
-}
-
-impl std::error::Error for NotInFieldError {}
-
-impl TryInto<Scalar> for blst_scalar {
-    type Error = NotInFieldError;
-
-    fn try_into(self) -> Result<Scalar, Self::Error> {
-        if !unsafe { blst_scalar_fr_check(&self) } {
-            return Err(NotInFieldError);
-        }
-
-        let mut out = blst_fr::default();
-
-        unsafe { blst_fr_from_scalar(&mut out, &self) };
-
-        Ok(Scalar(out))
-    }
+    // Return `false` if `le_bytes` is the modulus.
+    false
 }
 
 impl Scalar {
@@ -583,87 +405,99 @@ impl Scalar {
     /// a scalar into a `Scalar`, failing if the input is not canonical.
     pub fn from_bytes_le(bytes: &[u8; 32]) -> Option<Scalar> {
         let mut raw = blst_scalar::default();
-
+        let mut out = blst_fr::default();
         unsafe {
             blst_scalar_from_lendian(&mut raw, bytes.as_ptr());
-        }
-
-        raw.try_into().ok()
+            if !blst_scalar_fr_check(&raw) {
+                return None;
+            }
+            blst_fr_from_scalar(&mut out, &raw);
+        };
+        Some(Scalar(out))
     }
 
     /// Attempts to convert a big-endian byte representation of
     /// a scalar into a `Scalar`, failing if the input is not canonical.
-    pub fn from_bytes_be(bytes: &[u8; 32]) -> Option<Scalar> {
-        let mut raw = blst_scalar::default();
-
-        unsafe {
-            blst_scalar_from_bendian(&mut raw, bytes.as_ptr());
-        }
-
-        raw.try_into().ok()
+    pub fn from_bytes_be(be_bytes: &[u8; 32]) -> Option<Scalar> {
+        let mut le_bytes = *be_bytes;
+        le_bytes.reverse();
+        Self::from_bytes_le(&le_bytes)
     }
 
     /// Converts an element of `Scalar` into a byte representation in
     /// little-endian byte order.
     pub fn to_bytes_le(&self) -> [u8; 32] {
-        let mut out = [0u8; 32];
-
+        let mut repr = [0u8; 32];
         let mut scalar = blst_scalar::default();
         unsafe {
             blst_scalar_from_fr(&mut scalar, &self.0);
-            blst_lendian_from_scalar(out.as_mut_ptr(), &scalar);
+            blst_lendian_from_scalar(repr.as_mut_ptr(), &scalar);
         }
-
-        out
+        repr
     }
 
     /// Converts an element of `Scalar` into a byte representation in
     /// big-endian byte order.
     pub fn to_bytes_be(&self) -> [u8; 32] {
-        let mut out = [0u8; 32];
+        let mut bytes = self.to_bytes_le();
+        bytes.reverse();
+        bytes
+    }
 
-        let mut scalar = blst_scalar::default();
-        unsafe {
-            blst_scalar_from_fr(&mut scalar, &self.0);
-            blst_bendian_from_scalar(out.as_mut_ptr(), &scalar);
+    // `u64s` represent a little-endian non-Montgomery form integer mod p.
+    pub fn from_u64s_le(u64s: &[u64; 4]) -> Option<Self> {
+        let mut le_bytes = [0u8; 32];
+        le_bytes[..8].copy_from_slice(&u64s[0].to_le_bytes());
+        le_bytes[8..16].copy_from_slice(&u64s[1].to_le_bytes());
+        le_bytes[16..24].copy_from_slice(&u64s[2].to_le_bytes());
+        le_bytes[24..].copy_from_slice(&u64s[3].to_le_bytes());
+        Scalar::from_bytes_le(&le_bytes)
+    }
+
+    pub fn is_quad_res(&self) -> bool {
+        match self.legendre() {
+            0 | 1 => true,
+            _ => false,
+        }
+    }
+
+    fn legendre(&self) -> i8 {
+        const MOD_MINUS_1_OVER_2: [u64; 4] = [
+            0x7fffffff80000000,
+            0xa9ded2017fff2dff,
+            0x199cec0404d0ec02,
+            0x39f6d3a994cebea4,
+        ];
+        // s = self^((modulus - 1) // 2)
+        let s = self.pow_vartime(MOD_MINUS_1_OVER_2);
+        if s == Self::zero() {
+            0
+        } else if s == Self::one() {
+            1
+        } else {
+            -1
+        }
+    }
+
+    pub fn is_even(&self) -> bool {
+        !self.is_odd()
+    }
+
+    pub fn char() -> <Self as PrimeField>::Repr {
+        MODULUS_REPR
+    }
+
+    pub fn num_bits(&self) -> u32 {
+        let mut ret = 256;
+        for i in self.to_bytes_be().iter() {
+            let leading = i.leading_zeros();
+            ret -= leading;
+            if leading != 8 {
+                break;
+            }
         }
 
-        out
-    }
-
-    /// Multiplies `rhs` by `self`, returning the result.
-    #[inline]
-    pub fn mul(&self, rhs: &Self) -> Self {
-        let mut out = blst_fr::default();
-
-        unsafe { blst_fr_mul(&mut out, &self.0, &rhs.0) };
-
-        Scalar(out)
-    }
-
-    /// Subtracts `rhs` from `self`, returning the result.
-    #[inline]
-    pub fn sub(&self, rhs: &Self) -> Self {
-        let mut out = blst_fr::default();
-
-        unsafe { blst_fr_sub(&mut out, &self.0, &rhs.0) };
-
-        Scalar(out)
-    }
-
-    /// Adds `rhs` to `self`, returning the result.
-    #[inline]
-    pub fn add(&self, rhs: &Self) -> Self {
-        let mut out = blst_fr::default();
-
-        unsafe { blst_fr_add(&mut out, &self.0, &rhs.0) };
-
-        Scalar(out)
-    }
-
-    /// Returns true if this element is zero.
-    pub fn is_zero(&self) -> bool {
-        self.0.l.iter().all(|&e| e == 0)
+        ret
     }
 
     /// Multiplies `self` with `3`, returning the result.
@@ -696,22 +530,13 @@ impl Scalar {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scalar, ScalarRepr, MODULUS, R};
+    use super::*;
 
-    use fff::{Field, PrimeField, PrimeFieldRepr, SqrtField};
     use rand_core::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
     /// INV = -(q^{-1} mod 2^64) mod 2^64
     const INV: u64 = 0xfffffffeffffffff;
-
-    /// R^2 = 2^512 mod q
-    const R2: ScalarRepr = ScalarRepr([
-        0x00000001fffffffe,
-        0x5884b7fa00034802,
-        0x998c4fefecbc4ff5,
-        0x1824b159acc5056f,
-    ]);
 
     const LARGEST: Scalar = Scalar(blst::blst_fr {
         l: [
@@ -730,7 +555,7 @@ mod tests {
         let mut inv = 1u64;
         for _ in 0..63 {
             inv = inv.wrapping_mul(inv);
-            inv = inv.wrapping_mul(MODULUS.0[0]);
+            inv = inv.wrapping_mul(MODULUS[0]);
         }
         inv = inv.wrapping_neg();
 
@@ -748,7 +573,7 @@ mod tests {
             "Scalar(0x0000000000000000000000000000000000000000000000000000000000000001)"
         );
         assert_eq!(
-            format!("{:?}", Scalar::from_repr(R2).unwrap()),
+            format!("{:?}", R2),
             "Scalar(0x1824b159acc5056f998c4fefecbc4ff55884b7fa0003480200000001fffffffe)"
         );
     }
@@ -757,13 +582,10 @@ mod tests {
     fn test_equality() {
         assert_eq!(Scalar::zero(), Scalar::zero());
         assert_eq!(Scalar::one(), Scalar::one());
-        assert_eq!(
-            Scalar::from_repr(R2).unwrap(),
-            Scalar::from_repr(R2).unwrap()
-        );
+        assert_eq!(R2, R2);
 
-        assert!(Scalar::zero() != Scalar::one());
-        assert!(Scalar::one() != Scalar::from_repr(R2).unwrap());
+        assert_ne!(Scalar::zero(), Scalar::one());
+        assert_ne!(Scalar::one(), R2);
     }
 
     #[test]
@@ -785,7 +607,7 @@ mod tests {
         );
 
         assert_eq!(
-            Scalar::from_repr(R2).unwrap().to_bytes_le(),
+            R2.to_bytes_le(),
             [
                 254, 255, 255, 255, 1, 0, 0, 0, 2, 72, 3, 0, 250, 183, 132, 88, 245, 79, 188, 236,
                 239, 79, 140, 153, 111, 5, 197, 172, 89, 177, 36, 24
@@ -827,7 +649,7 @@ mod tests {
                 239, 79, 140, 153, 111, 5, 197, 172, 89, 177, 36, 24
             ])
             .unwrap(),
-            Scalar::from_repr(R2).unwrap(),
+            R2,
         );
 
         // -1 should work
@@ -838,11 +660,7 @@ mod tests {
         .is_some());
 
         // modulus is invalid
-        assert!(Scalar::from_bytes_le(&[
-            1, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
-            216, 57, 51, 72, 125, 157, 41, 83, 167, 237, 115
-        ])
-        .is_none());
+        assert!(Scalar::from_bytes_le(&MODULUS_REPR).is_none());
 
         // Anything larger than the modulus is invalid
         assert!(Scalar::from_bytes_le(&[
@@ -937,7 +755,7 @@ mod tests {
         let mut tmp = Scalar::zero();
         tmp -= &LARGEST;
 
-        let mut tmp2 = Scalar(blst::blst_fr { l: MODULUS.0 });
+        let mut tmp2 = Scalar(blst::blst_fr { l: MODULUS });
         tmp2 -= &LARGEST;
 
         assert_eq!(tmp, tmp2);
@@ -1027,16 +845,16 @@ mod tests {
             0x73eda753299d7d48,
         ];
 
-        let mut r1 = Scalar::from_repr(R).unwrap();
+        let mut r1 = R;
         let mut r2 = r1;
 
         for _ in 0..100 {
-            r1 = r1.inverse().unwrap();
-            r2 = r2.pow(&q_minus_2);
+            r1 = r1.invert().unwrap();
+            r2 = r2.pow_vartime(&q_minus_2);
 
             assert_eq!(r1, r2);
             // Add R so we check something different next time around
-            r1 += &Scalar::from_repr(R).unwrap();
+            r1 += R;
             r2 = r1;
         }
     }
@@ -1060,7 +878,7 @@ mod tests {
 
         for _ in 0..100 {
             let square_root = square.sqrt();
-            if square_root.is_none() {
+            if square_root.is_none().into() {
                 none_count += 1;
             } else {
                 assert_eq!(square_root.unwrap() * square_root.unwrap(), square);
@@ -1073,397 +891,115 @@ mod tests {
 
     #[test]
     fn test_double() {
-        let a = Scalar::from_repr(ScalarRepr([
+        let a = Scalar::from_u64s_le(&[
             0x1fff3231233ffffd,
             0x4884b7fa00034802,
             0x998c4fefecbc4ff3,
             0x1824b159acc50562,
-        ]))
+        ])
         .unwrap();
 
-        let mut b = a;
-        b.double();
-        assert_eq!(b, a + a);
+        assert_eq!(a.double(), a + a);
     }
 
     #[test]
-    fn test_scalar_repr_ordering() {
-        fn assert_equality(a: ScalarRepr, b: ScalarRepr) {
+    fn test_scalar_ordering() {
+        fn assert_equality(a: Scalar, b: Scalar) {
             assert_eq!(a, b);
             assert!(a.cmp(&b) == core::cmp::Ordering::Equal);
         }
 
-        fn assert_lt(a: ScalarRepr, b: ScalarRepr) {
+        fn assert_lt(a: Scalar, b: Scalar) {
             assert!(a < b);
             assert!(b > a);
         }
 
         assert_equality(
-            ScalarRepr::new([9999, 9999, 9999, 9999]),
-            ScalarRepr::new([9999, 9999, 9999, 9999]),
+            Scalar::from_u64s_le(&[9999, 9999, 9999, 9999]).unwrap(),
+            Scalar::from_u64s_le(&[9999, 9999, 9999, 9999]).unwrap(),
         );
         assert_equality(
-            ScalarRepr::new([9999, 9998, 9999, 9999]),
-            ScalarRepr::new([9999, 9998, 9999, 9999]),
+            Scalar::from_u64s_le(&[9999, 9998, 9999, 9999]).unwrap(),
+            Scalar::from_u64s_le(&[9999, 9998, 9999, 9999]).unwrap(),
         );
         assert_equality(
-            ScalarRepr::new([9999, 9999, 9999, 9997]),
-            ScalarRepr::new([9999, 9999, 9999, 9997]),
+            Scalar::from_u64s_le(&[9999, 9999, 9999, 9997]).unwrap(),
+            Scalar::from_u64s_le(&[9999, 9999, 9999, 9997]).unwrap(),
         );
         assert_lt(
-            ScalarRepr::new([9999, 9997, 9999, 9998]),
-            ScalarRepr::new([9999, 9997, 9999, 9999]),
+            Scalar::from_u64s_le(&[9999, 9997, 9999, 9998]).unwrap(),
+            Scalar::from_u64s_le(&[9999, 9997, 9999, 9999]).unwrap(),
         );
         assert_lt(
-            ScalarRepr::new([9999, 9997, 9998, 9999]),
-            ScalarRepr::new([9999, 9997, 9999, 9999]),
+            Scalar::from_u64s_le(&[9999, 9997, 9998, 9999]).unwrap(),
+            Scalar::from_u64s_le(&[9999, 9997, 9999, 9999]).unwrap(),
         );
         assert_lt(
-            ScalarRepr::new([9, 9999, 9999, 9997]),
-            ScalarRepr::new([9999, 9999, 9999, 9997]),
+            Scalar::from_u64s_le(&[9, 9999, 9999, 9997]).unwrap(),
+            Scalar::from_u64s_le(&[9999, 9999, 9999, 9997]).unwrap(),
         );
     }
 
     #[test]
-    fn test_scalar_repr_from() {
-        assert_eq!(ScalarRepr::from(100), ScalarRepr::new([100, 0, 0, 0]));
+    fn test_scalar_from_u64() {
+        let a = Scalar::from(100);
+        let mut expected_bytes = [0u8; 32];
+        expected_bytes[0] = 100;
+        assert_eq!(a.to_bytes_le(), expected_bytes);
     }
 
     #[test]
-    fn test_scalar_repr_is_odd() {
-        assert!(!ScalarRepr::from(0).is_odd());
-        assert!(ScalarRepr::from(0).is_even());
-        assert!(ScalarRepr::from(1).is_odd());
-        assert!(!ScalarRepr::from(1).is_even());
-        assert!(!ScalarRepr::from(324834872).is_odd());
-        assert!(ScalarRepr::from(324834872).is_even());
-        assert!(ScalarRepr::from(324834873).is_odd());
-        assert!(!ScalarRepr::from(324834873).is_even());
+    fn test_scalar_is_odd() {
+        assert!(Scalar::from(0).is_even());
+        assert!(Scalar::from(1).is_odd());
+        assert!(Scalar::from(324834872).is_even());
+        assert!(Scalar::from(324834873).is_odd());
     }
 
     #[test]
-    fn test_scalar_repr_is_zero() {
-        assert!(ScalarRepr::from(0).is_zero());
-        assert!(!ScalarRepr::from(1).is_zero());
-        assert!(!ScalarRepr::new([0, 0, 1, 0]).is_zero());
+    fn test_scalar_is_zero() {
+        assert!(Scalar::from(0).is_zero());
+        assert!(!Scalar::from(1).is_zero());
+        assert!(!Scalar::from_u64s_le(&[0, 0, 1, 0]).unwrap().is_zero());
     }
 
     #[test]
-    fn test_scalar_repr_div2() {
-        let mut a = ScalarRepr::new([
-            0xbd2920b19c972321,
-            0x174ed0466a3be37e,
-            0xd468d5e3b551f0b5,
-            0xcb67c072733beefc,
-        ]);
-        a.div2();
-        assert_eq!(
-            a,
-            ScalarRepr::new([
-                0x5e949058ce4b9190,
-                0x8ba76823351df1bf,
-                0x6a346af1daa8f85a,
-                0x65b3e039399df77e
-            ])
-        );
-        for _ in 0..10 {
-            a.div2();
-        }
-        assert_eq!(
-            a,
-            ScalarRepr::new([
-                0x6fd7a524163392e4,
-                0x16a2e9da08cd477c,
-                0xdf9a8d1abc76aa3e,
-                0x196cf80e4e677d
-            ])
-        );
-        for _ in 0..200 {
-            a.div2();
-        }
-        assert_eq!(a, ScalarRepr::new([0x196cf80e4e67, 0x0, 0x0, 0x0]));
-        for _ in 0..40 {
-            a.div2();
-        }
-        assert_eq!(a, ScalarRepr::new([0x19, 0x0, 0x0, 0x0]));
-        for _ in 0..4 {
-            a.div2();
-        }
-        assert_eq!(a, ScalarRepr::new([0x1, 0x0, 0x0, 0x0]));
-        a.div2();
-        assert!(a.is_zero());
-    }
+    fn test_scalar_num_bits() {
+        assert_eq!(Scalar::NUM_BITS, 255);
+        assert_eq!(Scalar::CAPACITY, 254);
 
-    #[test]
-    fn test_scalar_repr_shr() {
-        let mut a = ScalarRepr::new([
-            0xb33fbaec482a283f,
-            0x997de0d3a88cb3df,
-            0x9af62d2a9a0e5525,
-            0x36003ab08de70da1,
-        ]);
-        a.shr(0);
-        assert_eq!(
-            a,
-            ScalarRepr::new([
-                0xb33fbaec482a283f,
-                0x997de0d3a88cb3df,
-                0x9af62d2a9a0e5525,
-                0x36003ab08de70da1
-            ])
-        );
-        a.shr(1);
-        assert_eq!(
-            a,
-            ScalarRepr::new([
-                0xd99fdd762415141f,
-                0xccbef069d44659ef,
-                0xcd7b16954d072a92,
-                0x1b001d5846f386d0
-            ])
-        );
-        a.shr(50);
-        assert_eq!(
-            a,
-            ScalarRepr::new([
-                0xbc1a7511967bf667,
-                0xc5a55341caa4b32f,
-                0x75611bce1b4335e,
-                0x6c0
-            ])
-        );
-        a.shr(130);
-        assert_eq!(a, ScalarRepr::new([0x1d5846f386d0cd7, 0x1b0, 0x0, 0x0]));
-        a.shr(64);
-        assert_eq!(a, ScalarRepr::new([0x1b0, 0x0, 0x0, 0x0]));
-    }
-
-    #[test]
-    fn test_scalar_repr_mul2() {
-        let mut a = ScalarRepr::from(23712937547);
-        a.mul2();
-        assert_eq!(a, ScalarRepr::new([0xb0acd6c96, 0x0, 0x0, 0x0]));
-        for _ in 0..60 {
-            a.mul2();
-        }
-        assert_eq!(
-            a,
-            ScalarRepr::new([0x6000000000000000, 0xb0acd6c9, 0x0, 0x0])
-        );
-        for _ in 0..128 {
-            a.mul2();
-        }
-        assert_eq!(
-            a,
-            ScalarRepr::new([0x0, 0x0, 0x6000000000000000, 0xb0acd6c9])
-        );
-        for _ in 0..60 {
-            a.mul2();
-        }
-        assert_eq!(a, ScalarRepr::new([0x0, 0x0, 0x0, 0x9600000000000000]));
-        for _ in 0..7 {
-            a.mul2();
-        }
-        assert!(a.is_zero());
-    }
-
-    #[test]
-    fn test_scalar_repr_num_bits() {
-        let mut a = ScalarRepr::from(0);
+        let mut a = Scalar::from(0);
         assert_eq!(0, a.num_bits());
-        a = ScalarRepr::from(1);
-        for i in 1..257 {
+        a = Scalar::from(1);
+        assert_eq!(1, a.num_bits());
+        for i in 2..Scalar::NUM_BITS {
+            a = a.shl(1);
             assert_eq!(i, a.num_bits());
-            a.mul2();
         }
-        assert_eq!(0, a.num_bits());
-    }
-
-    #[test]
-    fn test_scalar_repr_sub_noborrow() {
-        let mut rng = XorShiftRng::from_seed([
-            0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
-            0xbc, 0xe5,
-        ]);
-
-        let mut t = ScalarRepr::new([
-            0x8e62a7e85264e2c3,
-            0xb23d34c1941d3ca,
-            0x5976930b7502dd15,
-            0x600f3fb517bf5495,
-        ]);
-        t.sub_noborrow(&ScalarRepr::new([
-            0xd64f669809cbc6a4,
-            0xfa76cb9d90cf7637,
-            0xfefb0df9038d43b3,
-            0x298a30c744b31acf,
-        ]));
-        assert!(
-            t == ScalarRepr::new([
-                0xb813415048991c1f,
-                0x10ad07ae88725d92,
-                0x5a7b851271759961,
-                0x36850eedd30c39c5
-            ])
-        );
-
-        for _ in 0..1000 {
-            let mut a = Scalar::random(&mut rng).into_repr();
-            a.0[3] >>= 30;
-            let mut b = a;
-            for _ in 0..10 {
-                b.mul2();
-            }
-            let mut c = b;
-            for _ in 0..10 {
-                c.mul2();
-            }
-
-            assert!(a < b);
-            assert!(b < c);
-
-            let mut csub_ba = c;
-            csub_ba.sub_noborrow(&b);
-            csub_ba.sub_noborrow(&a);
-
-            let mut csub_ab = c;
-            csub_ab.sub_noborrow(&a);
-            csub_ab.sub_noborrow(&b);
-
-            assert_eq!(csub_ab, csub_ba);
-        }
-
-        // Subtracting r+1 from r should produce -1 (mod 2**256)
-        let mut qplusone = ScalarRepr::new([
-            0xffffffff00000001,
-            0x53bda402fffe5bfe,
-            0x3339d80809a1d805,
-            0x73eda753299d7d48,
-        ]);
-        qplusone.sub_noborrow(&ScalarRepr::new([
-            0xffffffff00000002,
-            0x53bda402fffe5bfe,
-            0x3339d80809a1d805,
-            0x73eda753299d7d48,
-        ]));
-        assert_eq!(
-            qplusone,
-            ScalarRepr::new([
-                0xffffffffffffffff,
-                0xffffffffffffffff,
-                0xffffffffffffffff,
-                0xffffffffffffffff
-            ])
-        );
     }
 
     #[test]
     fn test_scalar_legendre() {
-        use fff::LegendreSymbol::*;
-        use fff::SqrtField;
+        assert_eq!(Scalar::zero().sqrt().unwrap(), Scalar::zero());
+        assert_eq!(Scalar::one().sqrt().unwrap(), Scalar::one());
 
-        assert_eq!(QuadraticResidue, Scalar::one().legendre());
-        assert_eq!(Zero, Scalar::zero().legendre());
-
-        let e = ScalarRepr::new([
+        let e = Scalar::from_u64s_le(&[
             0x0dbc5349cd5664da,
             0x8ac5b6296e3ae29d,
             0x127cb819feceaa3b,
             0x3a6b21fb03867191,
-        ]);
-        assert_eq!(QuadraticResidue, Scalar::from_repr(e).unwrap().legendre());
-        let e = ScalarRepr::new([
+        ])
+        .unwrap();
+        assert!(e.is_quad_res());
+
+        let e = Scalar::from_u64s_le(&[
             0x96341aefd047c045,
             0x9b5f4254500a4d65,
             0x1ee08223b68ac240,
             0x31d9cd545c0ec7c6,
-        ]);
-        assert_eq!(
-            QuadraticNonResidue,
-            Scalar::from_repr(e).unwrap().legendre()
-        );
-    }
-
-    #[test]
-    fn test_scalar_repr_add_nocarry() {
-        let mut rng = XorShiftRng::from_seed([
-            0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
-            0xbc, 0xe5,
-        ]);
-
-        let mut t = ScalarRepr::new([
-            0xd64f669809cbc6a4,
-            0xfa76cb9d90cf7637,
-            0xfefb0df9038d43b3,
-            0x298a30c744b31acf,
-        ]);
-        t.add_nocarry(&ScalarRepr::new([
-            0x8e62a7e85264e2c3,
-            0xb23d34c1941d3ca,
-            0x5976930b7502dd15,
-            0x600f3fb517bf5495,
-        ]));
-        assert_eq!(
-            t,
-            ScalarRepr::new([
-                0x64b20e805c30a967,
-                0x59a9ee9aa114a02,
-                0x5871a104789020c9,
-                0x8999707c5c726f65
-            ])
-        );
-
-        // Test for the associativity of addition.
-        for _ in 0..1000 {
-            let mut a = Scalar::random(&mut rng).into_repr();
-            let mut b = Scalar::random(&mut rng).into_repr();
-            let mut c = Scalar::random(&mut rng).into_repr();
-
-            // Unset the first few bits, so that overflow won't occur.
-            a.0[3] >>= 3;
-            b.0[3] >>= 3;
-            c.0[3] >>= 3;
-
-            let mut abc = a;
-            abc.add_nocarry(&b);
-            abc.add_nocarry(&c);
-
-            let mut acb = a;
-            acb.add_nocarry(&c);
-            acb.add_nocarry(&b);
-
-            let mut bac = b;
-            bac.add_nocarry(&a);
-            bac.add_nocarry(&c);
-
-            let mut bca = b;
-            bca.add_nocarry(&c);
-            bca.add_nocarry(&a);
-
-            let mut cab = c;
-            cab.add_nocarry(&a);
-            cab.add_nocarry(&b);
-
-            let mut cba = c;
-            cba.add_nocarry(&b);
-            cba.add_nocarry(&a);
-
-            assert_eq!(abc, acb);
-            assert_eq!(abc, bac);
-            assert_eq!(abc, bca);
-            assert_eq!(abc, cab);
-            assert_eq!(abc, cba);
-        }
-
-        // Adding 1 to (2^256 - 1) should produce zero
-        let mut x = ScalarRepr::new([
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-            0xffffffffffffffff,
-        ]);
-        x.add_nocarry(&ScalarRepr::from(1));
-        assert!(x.is_zero());
+        ])
+        .unwrap();
+        assert!(!e.is_quad_res());
     }
 
     #[test]
@@ -1535,7 +1071,7 @@ mod tests {
                 ],
             });
             tmp.add_assign(&Scalar(blst::blst_fr { l: [1, 0, 0, 0] }));
-            assert!(tmp.into_repr().is_zero());
+            assert!(tmp.is_zero());
             // Add a random number to another one such that the result is r - 1
             tmp = Scalar(blst::blst_fr {
                 l: [
@@ -1566,7 +1102,7 @@ mod tests {
             );
             // Add one to the result and test for it.
             tmp.add_assign(&Scalar(blst::blst_fr { l: [1, 0, 0, 0] }));
-            assert!(tmp.into_repr().is_zero());
+            assert!(tmp.is_zero());
         }
 
         // Test associativity
@@ -1782,7 +1318,7 @@ mod tests {
 
     #[test]
     fn test_scalar_squaring() {
-        let mut a = Scalar(blst::blst_fr {
+        let a = Scalar(blst::blst_fr {
             l: [
                 0xffffffffffffffff,
                 0xffffffffffffffff,
@@ -1791,15 +1327,14 @@ mod tests {
             ],
         });
         // assert!(a.is_valid());
-        a.square();
         assert_eq!(
-            a,
-            Scalar::from_repr(ScalarRepr::new([
+            a.square(),
+            Scalar::from_u64s_le(&[
                 0xc0d698e7bde077b8,
                 0xb79a310579e76ec2,
                 0xac1da8d0a9af4e5f,
                 0x13f629c49bf23e97
-            ]))
+            ])
             .unwrap()
         );
 
@@ -1812,8 +1347,7 @@ mod tests {
             // Ensure that (a * a) = a^2
             let a = Scalar::random(&mut rng);
 
-            let mut tmp = a;
-            tmp.square();
+            let tmp = a.square();
 
             let mut tmp2 = a;
             tmp2.mul_assign(&a);
@@ -1824,7 +1358,7 @@ mod tests {
 
     #[test]
     fn test_scalar_inverse() {
-        assert!(Scalar::zero().inverse().is_none());
+        assert_eq!(Scalar::zero().invert().is_none().unwrap_u8(), 1);
 
         let mut rng = XorShiftRng::from_seed([
             0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
@@ -1836,7 +1370,7 @@ mod tests {
         for i in 0..1000 {
             // Ensure that a * a^-1 = 1
             let mut a = Scalar::random(&mut rng);
-            let ainv = a.inverse().unwrap();
+            let ainv = a.invert().unwrap();
             a.mul_assign(&ainv);
             assert_eq!(a, one, "round {}", i);
         }
@@ -1851,21 +1385,18 @@ mod tests {
 
         for _ in 0..1000 {
             // Ensure doubling a is equivalent to adding a to itself.
-            let mut a = Scalar::random(&mut rng);
+            let a = Scalar::random(&mut rng);
             let mut b = a;
             b.add_assign(&a);
-            a.double();
-            assert_eq!(a, b);
+            assert_eq!(a.double(), b);
         }
     }
 
     #[test]
     fn test_scalar_negate() {
         {
-            let mut a = Scalar::zero();
-            a.negate();
-
-            assert!(a.is_zero());
+            let a = Scalar::zero();
+            assert!((-a).is_zero());
         }
 
         let mut rng = XorShiftRng::from_seed([
@@ -1876,10 +1407,7 @@ mod tests {
         for _ in 0..1000 {
             // Ensure (a - (-a)) = 0.
             let mut a = Scalar::random(&mut rng);
-            let mut b = a;
-            b.negate();
-            a.add_assign(&b);
-
+            a.add_assign(-a);
             assert!(a.is_zero());
         }
     }
@@ -1895,7 +1423,7 @@ mod tests {
             // Exponentiate by various small numbers and ensure it consists with repeated
             // multiplication.
             let a = Scalar::random(&mut rng);
-            let target = a.pow(&[i]);
+            let target = a.pow_vartime(&[i]);
             let mut c = Scalar::one();
             for _ in 0..i {
                 c.mul_assign(&a);
@@ -1907,42 +1435,33 @@ mod tests {
             // Exponentiating by the modulus should have no effect in a prime field.
             let a = Scalar::random(&mut rng);
 
-            assert_eq!(a, a.pow(Scalar::char()));
+            assert_eq!(a, a.pow_vartime(&MODULUS));
         }
     }
 
     #[test]
     fn test_scalar_sqrt() {
-        use fff::SqrtField;
-
         let mut rng = XorShiftRng::from_seed([
             0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
             0xbc, 0xe5,
         ]);
 
         assert_eq!(Scalar::zero().sqrt().unwrap(), Scalar::zero());
+        assert_eq!(Scalar::one().sqrt().unwrap(), Scalar::one());
 
         for _ in 0..1000 {
             // Ensure sqrt(a^2) = a or -a
             let a = Scalar::random(&mut rng);
-            let mut nega = a;
-            nega.negate();
-            let mut b = a;
-            b.square();
-
-            let b = b.sqrt().unwrap();
-
-            assert!(a == b || nega == b);
+            let a_new = a.square().sqrt().unwrap();
+            assert!(a_new == a || a_new == -a);
         }
 
         for _ in 0..1000 {
             // Ensure sqrt(a)^2 = a for random a
             let a = Scalar::random(&mut rng);
-
-            if let Some(mut tmp) = a.sqrt() {
-                tmp.square();
-
-                assert_eq!(a, tmp);
+            let sqrt = a.sqrt();
+            if sqrt.is_some().into() {
+                assert_eq!(sqrt.unwrap().square(), a);
             }
         }
     }
@@ -1950,43 +1469,44 @@ mod tests {
     #[test]
     fn test_scalar_from_into_repr() {
         // r + 1 should not be in the field
-        assert!(Scalar::from_repr(ScalarRepr::new([
+        assert!(Scalar::from_u64s_le(&[
             0xffffffff00000002,
             0x53bda402fffe5bfe,
             0x3339d80809a1d805,
             0x73eda753299d7d48
-        ]))
-        .is_err());
+        ])
+        .is_none());
 
-        // r should not be in the field
-        assert!(Scalar::from_repr(Scalar::char()).is_err());
+        // Modulus should not be in the field
+        assert!(Scalar::from_repr(Scalar::char()).is_none());
 
         // Multiply some arbitrary representations to see if the result is as expected.
-        let a = ScalarRepr::new([
+        let mut a = Scalar::from_u64s_le(&[
             0x25ebe3a3ad3c0c6a,
             0x6990e39d092e817c,
             0x941f900d42f5658e,
             0x44f8a103b38a71e0,
-        ]);
-        let mut a_fr = Scalar::from_repr(a).unwrap();
-        let b = ScalarRepr::new([
+        ])
+        .unwrap();
+        let b = Scalar::from_u64s_le(&[
             0x264e9454885e2475,
             0x46f7746bb0308370,
             0x4683ef5347411f9,
             0x58838d7f208d4492,
-        ]);
-        let b_fr = Scalar::from_repr(b).unwrap();
-        let c = ScalarRepr::new([
+        ])
+        .unwrap();
+        let c = Scalar::from_u64s_le(&[
             0x48a09ab93cfc740d,
             0x3a6600fbfc7a671,
             0x838567017501d767,
             0x7161d6da77745512,
-        ]);
-        a_fr.mul_assign(&b_fr);
-        assert_eq!(a_fr.into_repr(), c);
+        ])
+        .unwrap();
+        a.mul_assign(&b);
+        assert_eq!(a, c);
 
         // Zero should be in the field.
-        assert!(Scalar::from_repr(ScalarRepr::from(0)).unwrap().is_zero());
+        assert!(Scalar::from_repr([0u8; 32]).unwrap().is_zero());
 
         let mut rng = XorShiftRng::from_seed([
             0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
@@ -1996,57 +1516,9 @@ mod tests {
         for i in 0..1000 {
             // Try to turn Scalar elements into representations and back again, and compare.
             let a = Scalar::random(&mut rng);
-            let a_repr = a.into_repr();
-            let b_repr = ScalarRepr::from(a);
-            assert_eq!(a_repr, b_repr);
-            let a_again = Scalar::from_repr(a_repr).unwrap();
-
+            let a_again = Scalar::from_repr(a.to_repr()).unwrap();
             assert_eq!(a, a_again, "{}", i);
         }
-    }
-
-    #[test]
-    fn test_scalar_repr_display() {
-        assert_eq!(
-            format!(
-                "{}",
-                ScalarRepr::new([
-                    0x2829c242fa826143,
-                    0x1f32cf4dd4330917,
-                    0x932e4e479d168cd9,
-                    0x513c77587f563f64
-                ])
-            ),
-            "0x513c77587f563f64932e4e479d168cd91f32cf4dd43309172829c242fa826143".to_string()
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                ScalarRepr::new([
-                    0x25ebe3a3ad3c0c6a,
-                    0x6990e39d092e817c,
-                    0x941f900d42f5658e,
-                    0x44f8a103b38a71e0
-                ])
-            ),
-            "0x44f8a103b38a71e0941f900d42f5658e6990e39d092e817c25ebe3a3ad3c0c6a".to_string()
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                ScalarRepr::new([
-                    0xffffffffffffffff,
-                    0xffffffffffffffff,
-                    0xffffffffffffffff,
-                    0xffffffffffffffff
-                ])
-            ),
-            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()
-        );
-        assert_eq!(
-            format!("{}", ScalarRepr::new([0, 0, 0, 0])),
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
-        );
     }
 
     #[test]
@@ -2054,12 +1526,12 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Scalar::from_repr(ScalarRepr::new([
+                Scalar::from_u64s_le(&[
                     0xc3cae746a3b5ecc7,
                     0x185ec8eb3f5b5aee,
                     0x684499ffe4b9dd99,
                     0x7c9bba7afb68faa
-                ]))
+                ])
                 .unwrap()
             ),
             "Scalar(0x07c9bba7afb68faa684499ffe4b9dd99185ec8eb3f5b5aeec3cae746a3b5ecc7)"
@@ -2068,12 +1540,12 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Scalar::from_repr(ScalarRepr::new([
+                Scalar::from_u64s_le(&[
                     0x44c71298ff198106,
                     0xb0ad10817df79b6a,
                     0xd034a80a2b74132b,
                     0x41cf9a1336f50719
-                ]))
+                ])
                 .unwrap()
             ),
             "Scalar(0x41cf9a1336f50719d034a80a2b74132bb0ad10817df79b6a44c71298ff198106)"
@@ -2082,22 +1554,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_num_bits() {
-        assert_eq!(Scalar::NUM_BITS, 255);
-        assert_eq!(Scalar::CAPACITY, 254);
-    }
-
-    #[test]
     fn test_scalar_root_of_unity() {
-        use fff::SqrtField;
-
         assert_eq!(Scalar::S, 32);
+        assert_eq!(Scalar::multiplicative_generator(), Scalar::from(7));
         assert_eq!(
-            Scalar::multiplicative_generator(),
-            Scalar::from_repr(ScalarRepr::from(7)).unwrap()
-        );
-        assert_eq!(
-            Scalar::multiplicative_generator().pow([
+            Scalar::multiplicative_generator().pow_vartime([
                 0xfffe5bfeffffffff,
                 0x9a1d80553bda402,
                 0x299d7d483339d808,
@@ -2105,46 +1566,34 @@ mod tests {
             ]),
             Scalar::root_of_unity()
         );
-        assert_eq!(Scalar::root_of_unity().pow([1 << Scalar::S]), Scalar::one());
-        assert!(Scalar::multiplicative_generator().sqrt().is_none());
+        assert_eq!(
+            Scalar::root_of_unity().pow_vartime([1 << Scalar::S]),
+            Scalar::one()
+        );
+        assert!(!Scalar::multiplicative_generator().is_quad_res());
     }
 
     #[test]
     fn scalar_field_tests() {
         crate::tests::field::random_field_tests::<Scalar>();
         crate::tests::field::random_sqrt_tests::<Scalar>();
-        crate::tests::field::random_frobenius_tests::<Scalar, _>(Scalar::char(), 13);
         crate::tests::field::from_str_tests::<Scalar>();
     }
 
     #[test]
-    fn scalar_repr_tests() {
-        crate::tests::repr::random_repr_tests::<Scalar>();
-    }
-
-    #[test]
-    fn test_modulus() {
-        assert_eq!(
-            format!("{:?}", Scalar::char()),
-            "0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001"
-        );
-    }
-
-    #[test]
     fn test_scalar_repr_conversion() {
-        let a = ScalarRepr::from(1);
-        let b = ScalarRepr([1, 0, 0, 0]);
-        assert_eq!(a, b);
-
         let a = Scalar::from(1);
-        let b = Scalar::from_repr(ScalarRepr::from(1)).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(Scalar::from(1).into_repr(), ScalarRepr::from(1));
+        let mut expected_bytes = [0u8; 32];
+        expected_bytes[0] = 1;
+        assert_eq!(a, Scalar::from_repr(a.to_repr()).unwrap());
+        assert_eq!(a.to_repr(), expected_bytes);
+        assert_eq!(a, Scalar::from_repr(expected_bytes).unwrap());
 
         let a = Scalar::from(12);
-        assert_eq!(a, Scalar::from_repr(a.into_repr()).unwrap());
-
-        let a = ScalarRepr::from(12);
-        assert_eq!(Scalar::from_repr(a).unwrap().into_repr(), a);
+        let mut expected_bytes = [0u8; 32];
+        expected_bytes[0] = 12;
+        assert_eq!(a, Scalar::from_repr(a.to_repr()).unwrap());
+        assert_eq!(a.to_repr(), expected_bytes);
+        assert_eq!(a, Scalar::from_repr(expected_bytes).unwrap());
     }
 }

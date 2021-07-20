@@ -3,8 +3,8 @@ mod g1 {
     use rand_xorshift::XorShiftRng;
 
     use blstrs::*;
-    use fff::Field;
-    use groupy::CurveProjective;
+    use ff::Field;
+    use group::Group;
 
     #[bench]
     fn bench_g1_mul_assign(b: &mut ::test::Bencher) {
@@ -22,7 +22,7 @@ mod g1 {
         let mut count = 0;
         b.iter(|| {
             let mut tmp = v[count].0;
-            tmp.mul_assign(v[count].1);
+            tmp *= v[count].1;
             count = (count + 1) % SAMPLES;
             tmp
         });
@@ -49,7 +49,7 @@ mod g1 {
         let mut count = 0;
         b.iter(|| {
             let mut tmp = v[count].0;
-            tmp.add_assign(&v[count].1);
+            tmp += &v[count].1;
             count = (count + 1) % SAMPLES;
             tmp
         });
@@ -76,7 +76,7 @@ mod g1 {
         let mut count = 0;
         b.iter(|| {
             let mut tmp = v[count].0;
-            tmp.add_assign_mixed(&v[count].1);
+            tmp += &v[count].1;
             count = (count + 1) % SAMPLES;
             tmp
         });
@@ -88,8 +88,8 @@ mod g2 {
     use rand_xorshift::XorShiftRng;
 
     use blstrs::*;
-    use fff::Field;
-    use groupy::CurveProjective;
+    use ff::Field;
+    use group::Group;
 
     #[bench]
     fn bench_g2_mul_assign(b: &mut ::test::Bencher) {
@@ -107,7 +107,7 @@ mod g2 {
         let mut count = 0;
         b.iter(|| {
             let mut tmp = v[count].0;
-            tmp.mul_assign(v[count].1);
+            tmp *= v[count].1;
             count = (count + 1) % SAMPLES;
             tmp
         });
@@ -134,7 +134,7 @@ mod g2 {
         let mut count = 0;
         b.iter(|| {
             let mut tmp = v[count].0;
-            tmp.add_assign(&v[count].1);
+            tmp += &v[count].1;
             count = (count + 1) % SAMPLES;
             tmp
         });
@@ -161,7 +161,7 @@ mod g2 {
         let mut count = 0;
         b.iter(|| {
             let mut tmp = v[count].0;
-            tmp.add_assign_mixed(&v[count].1);
+            tmp += &v[count].1;
             count = (count + 1) % SAMPLES;
             tmp
         });

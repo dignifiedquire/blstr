@@ -1,15 +1,23 @@
-macro_rules! impl_add_binop_specify_output {
+// Requires the caller to manually implement `Add<&rhs, Output = output> for &lhs` and
+// `Sub<&rhs, Output = output> for &lhs`.
+macro_rules! impl_add_sub {
+    ($t:ident) => {
+        impl_add_sub!($t, $t, $t);
+    };
+    ($lhs:ident, $rhs:ident) => {
+        impl_add_sub!($lhs, $rhs, $lhs);
+    };
     ($lhs:ident, $rhs:ident, $output:ident) => {
-        impl<'b> Add<&'b $rhs> for $lhs {
+        impl Add<&$rhs> for $lhs {
             type Output = $output;
 
             #[inline]
-            fn add(self, rhs: &'b $rhs) -> $output {
+            fn add(self, rhs: &$rhs) -> $output {
                 &self + rhs
             }
         }
 
-        impl<'a> Add<$rhs> for &'a $lhs {
+        impl Add<$rhs> for &$lhs {
             type Output = $output;
 
             #[inline]
@@ -26,21 +34,17 @@ macro_rules! impl_add_binop_specify_output {
                 &self + &rhs
             }
         }
-    };
-}
 
-macro_rules! impl_sub_binop_specify_output {
-    ($lhs:ident, $rhs:ident, $output:ident) => {
-        impl<'b> Sub<&'b $rhs> for $lhs {
+        impl Sub<&$rhs> for $lhs {
             type Output = $output;
 
             #[inline]
-            fn sub(self, rhs: &'b $rhs) -> $output {
+            fn sub(self, rhs: &$rhs) -> $output {
                 &self - rhs
             }
         }
 
-        impl<'a> Sub<$rhs> for &'a $lhs {
+        impl Sub<$rhs> for &$lhs {
             type Output = $output;
 
             #[inline]
@@ -60,25 +64,48 @@ macro_rules! impl_sub_binop_specify_output {
     };
 }
 
-macro_rules! impl_binops_additive_specify_output {
-    ($lhs:ident, $rhs:ident, $output:ident) => {
-        impl_add_binop_specify_output!($lhs, $rhs, $output);
-        impl_sub_binop_specify_output!($lhs, $rhs, $output);
+// Requires the caller to manually implement `AddAssign<&rhs> for lhs` and
+// `SubAssign<&rhs> for lhs`.
+macro_rules! impl_add_sub_assign {
+    ($t:ident) => {
+        impl_add_sub_assign!($t, $t);
+    };
+    ($lhs:ident, $rhs:ident) => {
+        impl AddAssign<$rhs> for $lhs {
+            #[inline]
+            fn add_assign(&mut self, rhs: $rhs) {
+                self.add_assign(&rhs);
+            }
+        }
+
+        impl SubAssign<$rhs> for $lhs {
+            #[inline]
+            fn sub_assign(&mut self, rhs: $rhs) {
+                self.sub_assign(&rhs);
+            }
+        }
     };
 }
 
-macro_rules! impl_binops_multiplicative_mixed {
+// Requires the caller to manually implement `Mul<&rhs, Output = output> for &lhs`.
+macro_rules! impl_mul {
+    ($t:ident) => {
+        impl_mul!($t, $t, $t);
+    };
+    ($lhs:ident, $rhs:ident) => {
+        impl_mul!($lhs, $rhs, $lhs);
+    };
     ($lhs:ident, $rhs:ident, $output:ident) => {
-        impl<'b> Mul<&'b $rhs> for $lhs {
+        impl Mul<&$rhs> for $lhs {
             type Output = $output;
 
             #[inline]
-            fn mul(self, rhs: &'b $rhs) -> $output {
+            fn mul(self, rhs: &$rhs) -> $output {
                 &self * rhs
             }
         }
 
-        impl<'a> Mul<$rhs> for &'a $lhs {
+        impl Mul<$rhs> for &$lhs {
             type Output = $output;
 
             #[inline]
@@ -98,89 +125,16 @@ macro_rules! impl_binops_multiplicative_mixed {
     };
 }
 
-macro_rules! impl_binops_additive {
-    ($lhs:ident, $rhs:ident, $source:path) => {
-        impl_binops_additive_specify_output!($lhs, $rhs, $lhs);
-
-        impl SubAssign<$rhs> for $lhs {
-            #[inline]
-            fn sub_assign(&mut self, rhs: $rhs) {
-                <Self as $source>::sub_assign(self, &rhs);
-            }
-        }
-
-        impl AddAssign<$rhs> for $lhs {
-            #[inline]
-            fn add_assign(&mut self, rhs: $rhs) {
-                <Self as $source>::add_assign(self, &rhs);
-            }
-        }
-
-        impl<'b> SubAssign<&'b $rhs> for $lhs {
-            #[inline]
-            fn sub_assign(&mut self, rhs: &'b $rhs) {
-                <Self as $source>::sub_assign(self, rhs);
-            }
-        }
-
-        impl<'b> AddAssign<&'b $rhs> for $lhs {
-            #[inline]
-            fn add_assign(&mut self, rhs: &'b $rhs) {
-                <Self as $source>::add_assign(self, rhs);
-            }
-        }
+// Requires the caller to manually implement `MulAssign<&rhs> for lhs`.
+macro_rules! impl_mul_assign {
+    ($t:ident) => {
+        impl_mul_assign!($t, $t);
     };
-}
-
-macro_rules! impl_binops_additive_mixed {
-    ($lhs:ident, $rhs:ident, $source:path) => {
-        impl_binops_additive_specify_output!($lhs, $rhs, $lhs);
-
-        impl SubAssign<$rhs> for $lhs {
-            #[inline]
-            fn sub_assign(&mut self, rhs: $rhs) {
-                *self = &*self - rhs;
-            }
-        }
-
-        impl AddAssign<$rhs> for $lhs {
-            #[inline]
-            fn add_assign(&mut self, rhs: $rhs) {
-                <Self as $source>::add_assign_mixed(self, &rhs);
-            }
-        }
-
-        impl<'b> SubAssign<&'b $rhs> for $lhs {
-            #[inline]
-            fn sub_assign(&mut self, rhs: &'b $rhs) {
-                *self = &*self - rhs;
-            }
-        }
-
-        impl<'b> AddAssign<&'b $rhs> for $lhs {
-            #[inline]
-            fn add_assign(&mut self, rhs: &'b $rhs) {
-                <Self as $source>::add_assign_mixed(self, rhs);
-            }
-        }
-    };
-}
-
-macro_rules! impl_binops_multiplicative {
-    ($lhs:ident, $rhs:ident, $source:path) => {
-        impl_binops_multiplicative_mixed!($lhs, $rhs, $lhs);
-
+    ($lhs:ident, $rhs:ident) => {
         impl MulAssign<$rhs> for $lhs {
             #[inline]
             fn mul_assign(&mut self, rhs: $rhs) {
-                <Self as $source>::mul_assign(self, &rhs);
-            }
-        }
-
-        impl<'b> MulAssign<&'b $rhs> for $lhs {
-            #[inline]
-            fn mul_assign(&mut self, rhs: &'b $rhs) {
-                <Self as $source>::mul_assign(self, rhs);
+                self.mul_assign(&rhs);
             }
         }
     };

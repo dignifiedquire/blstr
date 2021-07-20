@@ -1,4 +1,4 @@
-use fff::{PrimeField, PrimeFieldRepr};
+use ff::{PrimeField, PrimeFieldRepr};
 use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
 
@@ -15,7 +15,7 @@ fn random_encoding_tests<P: PrimeField>() {
     ]);
 
     for _ in 0..1000 {
-        let r = P::random(&mut rng).into_repr();
+        let r = P::random(&mut rng).to_repr();
 
         // Big endian
         {
@@ -66,7 +66,7 @@ fn random_shl_tests<P: PrimeField>() {
     ]);
 
     for _ in 0..100 {
-        let r = P::random(&mut rng).into_repr();
+        let r = P::random(&mut rng).to_repr();
 
         for shift in 0..(r.num_bits() + 1) {
             let mut r1 = r;

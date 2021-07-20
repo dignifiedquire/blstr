@@ -2,8 +2,8 @@ use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
 
 use blstrs::*;
-use fff::Field;
-use groupy::CurveProjective;
+use ff::Field;
+use group::{Curve, Group};
 
 #[bench]
 fn bench_fp12_add_assign(b: &mut ::test::Bencher) {
@@ -21,7 +21,7 @@ fn bench_fp12_add_assign(b: &mut ::test::Bencher) {
     let mut count = 0;
     b.iter(|| {
         let mut tmp = v[count].0;
-        tmp.add_assign(&v[count].1);
+        tmp += &v[count].1;
         count = (count + 1) % SAMPLES;
         tmp
     });
@@ -43,7 +43,7 @@ fn bench_fp12_sub_assign(b: &mut ::test::Bencher) {
     let mut count = 0;
     b.iter(|| {
         let mut tmp = v[count].0;
-        tmp.sub_assign(&v[count].1);
+        tmp -= &v[count].1;
         count = (count + 1) % SAMPLES;
         tmp
     });
@@ -65,7 +65,7 @@ fn bench_fp12_mul_assign(b: &mut ::test::Bencher) {
     let mut count = 0;
     b.iter(|| {
         let mut tmp = v[count].0;
-        tmp.mul_assign(&v[count].1);
+        tmp *= &v[count].1;
         count = (count + 1) % SAMPLES;
         tmp
     });
@@ -104,7 +104,7 @@ fn bench_fp12_inverse(b: &mut ::test::Bencher) {
 
     let mut count = 0;
     b.iter(|| {
-        let tmp = v[count].inverse();
+        let tmp = v[count].invert();
         count = (count + 1) % SAMPLES;
         tmp
     });
@@ -121,9 +121,9 @@ fn bench_fp12_compress(b: &mut ::test::Bencher) {
 
     let v: Vec<Fp12> = (0..SAMPLES)
         .map(|_| {
-            let p = G1Projective::random(&mut rng).into_affine();
-            let q = G2Projective::random(&mut rng).into_affine();
-            blstrs::pairing(p, q)
+            let p = G1Projective::random(&mut rng).to_affine();
+            let q = G2Projective::random(&mut rng).to_affine();
+            blstrs::pairing(&p, &q)
         })
         .collect();
 
@@ -146,9 +146,9 @@ fn bench_fp12_uncompress(b: &mut ::test::Bencher) {
 
     let v: Vec<_> = (0..SAMPLES)
         .map(|_| {
-            let p = G1Projective::random(&mut rng).into_affine();
-            let q = G2Projective::random(&mut rng).into_affine();
-            blstrs::pairing(p, q).compress().unwrap()
+            let p = G1Projective::random(&mut rng).to_affine();
+            let q = G2Projective::random(&mut rng).to_affine();
+            blstrs::pairing(&p, &q).compress().unwrap()
         })
         .collect();
 

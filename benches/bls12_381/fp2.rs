@@ -2,7 +2,7 @@ use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
 
 use blstrs::*;
-use fff::{Field, SqrtField};
+use ff::Field;
 
 #[bench]
 fn bench_fp2_add_assign(b: &mut ::test::Bencher) {
@@ -20,7 +20,7 @@ fn bench_fp2_add_assign(b: &mut ::test::Bencher) {
     let mut count = 0;
     b.iter(|| {
         let mut tmp = v[count].0;
-        tmp.add_assign(&v[count].1);
+        tmp += &v[count].1;
         count = (count + 1) % SAMPLES;
         tmp
     });
@@ -42,7 +42,7 @@ fn bench_fp2_sub_assign(b: &mut ::test::Bencher) {
     let mut count = 0;
     b.iter(|| {
         let mut tmp = v[count].0;
-        tmp.sub_assign(&v[count].1);
+        tmp -= &v[count].1;
         count = (count + 1) % SAMPLES;
         tmp
     });
@@ -64,7 +64,7 @@ fn bench_fp2_mul_assign(b: &mut ::test::Bencher) {
     let mut count = 0;
     b.iter(|| {
         let mut tmp = v[count].0;
-        tmp.mul_assign(&v[count].1);
+        tmp *= &v[count].1;
         count = (count + 1) % SAMPLES;
         tmp
     });
@@ -103,7 +103,7 @@ fn bench_fp2_inverse(b: &mut ::test::Bencher) {
 
     let mut count = 0;
     b.iter(|| {
-        let tmp = v[count].inverse();
+        let tmp = v[count].invert();
         count = (count + 1) % SAMPLES;
         tmp
     });
