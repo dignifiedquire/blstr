@@ -36,7 +36,7 @@ jobs:
       - restore_cache:
           keys:
             - cargo-v5-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}-{{ arch }}
-      - run: rm -rf ~/.rustup
+      # - run: rm -rf ~/.rustup
       - run: rustup self update
       - run: rustup install stable
       - run: rustup default stable
